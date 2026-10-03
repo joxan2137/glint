@@ -11,8 +11,10 @@ mod math;
 mod model;
 mod ocr_text;
 mod pixels;
+mod prefs;
 mod preview;
 mod render;
+mod stroke_panel;
 mod text_edit;
 mod tools;
 mod viewport;
@@ -55,6 +57,7 @@ pub const MIN_WINDOW: SizeF = SizeF::new(760.0, 520.0);
 /// Opens a new editor window. Settings are a snapshot (save dir, format, theme).
 pub fn open_editor(app: &App, doc: EditorDoc, settings: &Settings, host: EditorHost) -> anyhow::Result<WindowId> {
     worker::install_handler(app);
+    tools::enable_persistence();
     let (work_px, dpi) = match &doc.monitor {
         Some(m) => (m.work_rect, m.dpi),
         None => cursor_work_area(),
@@ -95,8 +98,9 @@ pub fn window_size(image_px: SizeF, scale: f32, work_dip: SizeF) -> SizeF {
 }
 
 /// Offscreen render for visual checks: `editor`, `editor-pen`, `editor-shapes`, `editor-text`, `editor-crop`,
-/// `editor-hdr`, `editor-redact`, `editor-select` (plus `editor-ocr`, `editor-picker`, `editor-menu`; see
-/// `PREVIEW_KINDS`). Uses `image` when given, else a synthetic screenshot.
+/// `editor-hdr`, `editor-redact`, `editor-select` (plus `editor-ocr`, `editor-picker`, `editor-menu`,
+/// `editor-narrow`, `editor-stroke`, `editor-stroke-pen`; see `PREVIEW_KINDS`). Uses `image` when given, else a
+/// synthetic screenshot.
 pub fn render_preview(
     gfx: &Gfx,
     kind: &str,

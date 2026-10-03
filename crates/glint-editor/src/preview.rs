@@ -11,12 +11,12 @@ use glint_ui::{
 
 use crate::chrome::ToastKind;
 use crate::editor::EditorView;
-use crate::model::{Body, InkPoint, RedactKind, Redaction, Shape, ShapeKind, Stroke, StrokeKind, TextNote};
+use crate::model::{Body, Cap, Dash, InkPoint, RedactKind, Redaction, Shape, ShapeKind, Stroke, StrokeKind, TextNote};
 use crate::ocr_text::RecognizedText;
 use crate::tools::{self, Tool};
 use crate::EditorDoc;
 
-pub const KINDS: [&str; 12] = [
+pub const KINDS: [&str; 14] = [
     "editor",
     "editor-pen",
     "editor-shapes",
@@ -29,6 +29,8 @@ pub const KINDS: [&str; 12] = [
     "editor-picker",
     "editor-menu",
     "editor-narrow",
+    "editor-stroke",
+    "editor-stroke-pen",
 ];
 
 pub const WINDOW: SizeF = SizeF::new(1200.0, 760.0);
@@ -255,13 +257,17 @@ fn swell(t: f32) -> f32 {
     (0.25 + 0.75 * (std::f32::consts::PI * t).sin().max(0.0).powf(0.6)) * 0.82
 }
 
-fn stroke(points: Vec<InkPoint>, color: Color, width: f32, kind: StrokeKind, pressure: bool) -> Body {
+fn ink(points: Vec<InkPoint>, color: Color, width: f32, kind: StrokeKind, pressure: bool) -> Stroke {
     let min = width * 0.08;
-    Body::Stroke(Stroke { kind, points: crate::ink::finalize(&points, min), color, width, pressure })
+    Stroke { pressure, ..Stroke::new(kind, crate::ink::simplify(&points, min), color, width) }
+}
+
+fn stroke(points: Vec<InkPoint>, color: Color, width: f32, kind: StrokeKind, pressure: bool) -> Body {
+    Body::Stroke(ink(points, color, width, kind, pressure))
 }
 
 fn shape(kind: ShapeKind, a: PointF, b: PointF, color: Color, width: f32, filled: bool) -> Body {
-    Body::Shape(Shape { kind, start: a, end: b, color, width, filled })
+    Body::Shape(Shape { filled, ..Shape::new(kind, a, b, color, width) })
 }
 
 fn note(origin: PointF, text: &str, size: f32, color: Color, background: bool) -> Body {
@@ -363,7 +369,7 @@ fn stage(gfx: &Rc<Gfx>, kind: &str, image: Option<&Image>, scale: f32) -> Result
         "editor-pen" => {
             view.stage_tool(Tool::Pen, |o| {
                 o.color = red;
-                o.size = 1;
+                o.width = tools::PEN_SIZES[1];
             });
             let doc = view.doc_mut();
             doc.add(highlight(gfx, space, 0, usize::MAX, yellow, hl_w(1)));
@@ -468,6 +474,70 @@ fn stage(gfx: &Rc<Gfx>, kind: &str, image: Option<&Image>, scale: f32) -> Result
             let ring = pen_stroke(space, 90, |t| (1223.0 + 44.0 * (t * 6.6).cos(), 298.0 + 32.0 * (t * 6.6).sin()), swell);
             view.doc_mut().add(stroke(ring, custom, pen_w(1), StrokeKind::Pen, true));
         }
+        "editor-stroke" => {
+            view.stage_tool(Tool::Shapes, |o| {
+                o.shape = ShapeKind::Arrow;
+                o.color = red;
+            });
+            let purple = tools::palette(5);
+            let doc = view.doc_mut();
+            doc.add(highlight(gfx, space, 1, 6, yellow, hl_w(1)));
+            doc.add(Body::Shape(Shape {
+                dash: Dash::Dashed,
+                corner_radius: 18.0 * px,
+                filled: true,
+                fill_opacity: 0.10,
+                ..Shape::new(ShapeKind::Rectangle, space.p(926.0, 186.0), space.p(1414.0, 514.0), blue, 3.0 * px)
+            }));
+            doc.add(Body::Shape(Shape {
+                dash: Dash::Dotted,
+                ..Shape::new(ShapeKind::Line, space.p(302.0, 152.0), space.p(534.0, 152.0), orange, 4.0 * px)
+            }));
+            let lasso = pen_stroke(
+                space,
+                140,
+                |t| {
+                    let a = -2.0 + t * 7.4;
+                    (352.0 + 52.0 * a.cos() + 10.0 * t, 252.0 + 44.0 * a.sin() - 6.0 * t)
+                },
+                swell,
+            );
+            doc.add(Body::Stroke(Stroke { opacity: 0.55, ..ink(lasso, purple, 9.0 * px, StrokeKind::Pen, true) }));
+            let arrow = doc.add(Body::Shape(Shape {
+                caps: [Cap::Dot, Cap::FilledArrow],
+                head_scale: 1.2,
+                ..Shape::new(ShapeKind::Arrow, space.p(800.0, 548.0), space.p(566.0, 548.0), red, 5.0 * px)
+            }));
+            view.stage_selection(Some(arrow));
+        }
+        "editor-stroke-pen" => {
+            view.stage_tool(Tool::Pen, |o| {
+                o.color = blue;
+                o.width = 6.0;
+                o.opacity = 0.85;
+                o.smoothing = 45.0;
+            });
+            let doc = view.doc_mut();
+            let ring = pen_stroke(
+                space,
+                110,
+                |t| {
+                    let a = -1.6 + t * 6.75;
+                    (1223.0 + 46.0 * a.cos(), 296.0 + 34.0 * a.sin())
+                },
+                swell,
+            );
+            doc.add(Body::Stroke(Stroke { opacity: 0.85, smoothing: 45.0, ..ink(ring, blue, 6.0 * px, StrokeKind::Pen, true) }));
+            let underline = pen_stroke(space, 60, |t| (300.0 + 236.0 * t, 150.0 + 2.0 * (t * 5.0).sin() + 1.5 * t), |_| 0.5);
+            doc.add(Body::Stroke(Stroke { dash: Dash::Dashed, ..ink(underline, red, 4.0 * px, StrokeKind::Pen, false) }));
+            let check = pen_stroke(
+                space,
+                40,
+                |t| if t < 0.35 { (580.0 + 30.0 * t, 540.0 + 50.0 * t) } else { (590.5 + 70.0 * (t - 0.35), 557.5 - 64.0 * (t - 0.35)) },
+                |t| 0.35 + 0.6 * t,
+            );
+            doc.add(stroke(check, green, pen_w(2), StrokeKind::Pen, true));
+        }
         "editor-narrow" => {
             view.stage_tool(Tool::Shapes, |o| o.shape = ShapeKind::Arrow);
             let doc = view.doc_mut();
@@ -497,6 +567,7 @@ fn finish(gfx: &Rc<Gfx>, kind: &str, staged: &mut Staged, scale: f32) {
         "editor-picker" => view.stage_picker(),
         "editor-menu" => view.stage_menu(gfx, Some(1)),
         "editor-pen" => view.stage_hover(PointF::new(820.0, 420.0)),
+        "editor-stroke" | "editor-stroke-pen" => view.stage_stroke_popover(),
         _ => {}
     }
 }

@@ -212,6 +212,8 @@ dependencies = [
  "glint-sys",
  "glint-ui",
  "log",
+ "serde",
+ "serde_json",
  "unicode-segmentation",
  "windows",
  "windows-core",

@@ -78,6 +78,10 @@ impl EditorView {
         self.chrome.force_hdr_popover();
     }
 
+    pub(crate) fn stage_stroke_popover(&mut self) {
+        self.chrome.force_stroke_popover();
+    }
+
     pub(crate) fn stage_picker(&mut self) {
         self.chrome.force_picker();
     }

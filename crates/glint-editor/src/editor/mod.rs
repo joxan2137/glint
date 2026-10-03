@@ -22,13 +22,27 @@ use crate::history::History;
 use crate::model::{Body, Document, InkPoint, Redaction, Shape, StrokeKind};
 use crate::ocr_text::RecognizedText;
 use crate::render::{GeometryCache, GfxMeasure, Layer};
-use crate::tools::{self, HIGHLIGHTER_SIZES, PEN_SIZES, SHAPE_SIZES, TEXT_SIZES, Tool, ToolOptions};
+use crate::model::{Annotation, ShapeKind};
+use crate::stroke_panel::{StrokeChange, StrokeSpec, StrokeTarget};
+use crate::tools::{self, TEXT_SIZES, Tool, ToolOptions};
 use crate::viewport::{self, Mapping, Viewport};
 use crate::worker::{Poster, Retoner};
 
 const TIMER_CARET: u64 = 1;
 const TIMER_TOAST: u64 = 2;
 const TIMER_AUTOCOPY: u64 = 3;
+const TIMER_PERSIST: u64 = 4;
+
+/// How an option edit enters the undo history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditPhase {
+    /// A slider is still moving: the step stays open.
+    Dragging,
+    /// The slider was released: the open step closes.
+    Released,
+    /// A click, key or wheel notch: one step, merged with quick repeats on the same object.
+    Discrete,
+}
 
 enum Gesture {
     None,
@@ -108,7 +122,7 @@ pub(crate) struct EditorView {
     mode: CaptureMode,
     delay: u32,
     poster: Option<Poster>,
-    timers: [Option<TimerId>; 4],
+    timers: [Option<TimerId>; 5],
     unsynced_changes: bool,
     /// (object, frame time) of the last option edit on a selection; rapid edits (a color drag) share one undo step.
     last_option_edit: Option<(u64, f64)>,
@@ -171,7 +185,7 @@ impl EditorView {
             mode,
             delay: settings.capture.delay_secs,
             poster: None,
-            timers: [None; 4],
+            timers: [None; 5],
             unsynced_changes: false,
             last_option_edit: None,
         }
@@ -259,14 +273,23 @@ impl EditorView {
         match &a.body {
             Body::Stroke(s) => {
                 o.color = s.color;
-                let presets = if s.kind == StrokeKind::Highlighter { &HIGHLIGHTER_SIZES } else { &PEN_SIZES };
-                o.size = tools::nearest(presets, s.width / px);
+                o.width = s.width / px;
+                o.opacity = s.opacity;
+                o.dash = s.dash;
+                o.pressure = s.pressure;
+                o.smoothing = s.smoothing;
             }
             Body::Shape(s) => {
                 o.color = s.color;
-                o.size = tools::nearest(&SHAPE_SIZES, s.width / px);
+                o.width = s.width / px;
                 o.shape = s.kind;
                 o.filled = s.filled;
+                o.opacity = s.opacity;
+                o.dash = s.dash;
+                o.fill_opacity = s.fill_opacity;
+                o.corner_radius = s.corner_radius / px;
+                o.head_scale = s.head_scale;
+                o.set_caps(s.kind, s.caps);
             }
             Body::Text(t) => {
                 o.color = t.color;
@@ -276,6 +299,32 @@ impl EditorView {
             Body::Redact(r) => o.redact = r.kind,
         }
         Some(o)
+    }
+
+    /// The stroke button and popover's view of `o` for `tool`, in image pixels.
+    fn stroke_spec(&self, tool: Tool, o: &ToolOptions) -> Option<StrokeSpec> {
+        let target = match tool {
+            Tool::Pen => StrokeTarget::Pen,
+            Tool::Highlighter => StrokeTarget::Highlighter,
+            Tool::Shapes => StrokeTarget::for_shape(o.shape),
+            _ => return None,
+        };
+        let px = self.image_scale;
+        Some(StrokeSpec {
+            target,
+            color: o.color,
+            width: o.width * px,
+            opacity: o.opacity,
+            dash: if target == StrokeTarget::Highlighter { crate::model::Dash::Solid } else { o.dash },
+            pressure: o.pressure,
+            smoothing: o.smoothing,
+            caps: o.caps(o.shape),
+            head_scale: o.head_scale,
+            corner_radius: o.corner_radius * px,
+            filled: o.filled,
+            fill_opacity: o.fill_opacity,
+            px_per_dip: px,
+        })
     }
 
     fn chrome_state(&self) -> ChromeState {
@@ -314,6 +363,8 @@ impl EditorView {
             ocr,
             mode: self.mode,
             delay: self.delay,
+            stroke: options_tool.and_then(|t| self.stroke_spec(t, &options)),
+            preset: options_tool.and_then(|t| options.preset(t)),
         }
     }
 
@@ -435,7 +486,11 @@ impl EditorView {
                     }
                 });
             }
-            ChromeAction::Size(size) => self.change_options(cx, |o| o.size = size),
+            ChromeAction::Size(size) => {
+                let tool = self.chrome_state().options_tool.unwrap_or(self.tool);
+                let width = ToolOptions::presets(tool)[size.min(2)];
+                self.change_options(cx, |o| o.width = width);
+            }
             ChromeAction::Shape(shape) => self.change_options(cx, |o| o.shape = shape),
             ChromeAction::Fill(filled) => self.change_options(cx, |o| o.filled = filled),
             ChromeAction::TextSize(size) => self.change_options(cx, |o| o.text_size = size),
@@ -460,8 +515,94 @@ impl EditorView {
             }
             ChromeAction::OcrCopyAll => self.copy_ocr_text(cx, true),
             ChromeAction::OcrClose => self.exit_ocr(),
+            ChromeAction::Stroke { change, done } => {
+                let discrete = !matches!(
+                    change,
+                    StrokeChange::Width(_)
+                        | StrokeChange::Opacity(_)
+                        | StrokeChange::Smoothing(_)
+                        | StrokeChange::HeadScale(_)
+                        | StrokeChange::CornerRadius(_)
+                        | StrokeChange::FillOpacity(_)
+                );
+                let phase = match (discrete, done) {
+                    (true, _) => EditPhase::Discrete,
+                    (false, false) => EditPhase::Dragging,
+                    (false, true) => EditPhase::Released,
+                };
+                self.change_stroke(cx, change, phase);
+            }
+            ChromeAction::WidthStep(steps) => {
+                self.step_width(cx, steps);
+            }
         }
         cx.request_paint();
+    }
+
+    /// Applies a stroke setting to the tool's defaults and, when an object of that kind is selected, to the object.
+    fn change_stroke(&mut self, cx: &mut Ctx, change: StrokeChange, phase: EditPhase) {
+        let state = self.chrome_state();
+        let (Some(tool), Some(spec)) = (state.options_tool, state.stroke) else { return };
+        let kind = match spec.target {
+            StrokeTarget::Line => ShapeKind::Line,
+            StrokeTarget::Arrow => ShapeKind::Arrow,
+            StrokeTarget::Ellipse => ShapeKind::Ellipse,
+            _ => ShapeKind::Rectangle,
+        };
+        apply_stroke_to_options(&mut self.options[tool.index()], change, kind, self.image_scale);
+        if self.selection_tool() == Some(tool) {
+            self.edit_selection(cx, phase, |a| apply_stroke_to_annotation(a, change));
+        }
+        tools::remember(self.tool, &self.options);
+        self.schedule_persist(cx);
+    }
+
+    /// `[` / `]` and the wheel over the stroke button.
+    fn step_width(&mut self, cx: &mut Ctx, steps: i32) -> bool {
+        let Some(spec) = self.chrome_state().stroke else { return false };
+        let width = tools::step_width(spec.width, steps);
+        if (width - spec.width).abs() > 1e-3 {
+            self.change_stroke(cx, StrokeChange::Width(width), EditPhase::Discrete);
+        }
+        true
+    }
+
+    /// Edits the selected object; `phase` decides how the edit joins the undo history.
+    fn edit_selection(&mut self, cx: &mut Ctx, phase: EditPhase, edit: impl Fn(&mut Annotation)) {
+        let Some(id) = self.selection else { return };
+        match phase {
+            EditPhase::Dragging | EditPhase::Released => {
+                self.history.begin(&self.doc);
+                if let Some(a) = self.doc.get_mut(id) {
+                    edit(a);
+                }
+                if phase == EditPhase::Released && self.history.commit(&self.doc) {
+                    self.after_change(cx);
+                }
+            }
+            EditPhase::Discrete => {
+                let before = self.doc.clone();
+                if let Some(a) = self.doc.get_mut(id) {
+                    edit(a);
+                }
+                if self.doc != before {
+                    let now = glint_ui::anim::now();
+                    let continuing = self.last_option_edit.is_some_and(|(last, at)| last == id && now - at < 1.0);
+                    if !continuing {
+                        self.history.record(&before);
+                    }
+                    self.last_option_edit = Some((id, now));
+                    self.after_change(cx);
+                }
+            }
+        }
+        cx.request_paint();
+    }
+
+    fn schedule_persist(&mut self, cx: &mut Ctx) {
+        if cx.app().is_some() {
+            self.set_view_timer(cx, TIMER_PERSIST, 1200);
+        }
     }
 
     /// Applies an option change to the tool and, when an object of that kind is selected, to the object.
@@ -469,25 +610,14 @@ impl EditorView {
         let target_tool = self.chrome_state().options_tool.unwrap_or(self.tool);
         change(&mut self.options[target_tool.index()]);
         if self.selection_tool() == Some(target_tool)
-            && let Some(id) = self.selection
             && let Some(mut o) = self.selection_options(target_tool)
         {
             change(&mut o);
-            let before = self.doc.clone();
-            if let Some(a) = self.doc.get_mut(id) {
-                apply_options(a, &o, self.image_scale);
-            }
-            if self.doc != before {
-                let now = glint_ui::anim::now();
-                let continuing = self.last_option_edit.is_some_and(|(last, at)| last == id && now - at < 1.0);
-                if !continuing {
-                    self.history.record(&before);
-                }
-                self.last_option_edit = Some((id, now));
-                self.after_change(cx);
-            }
+            let scale = self.image_scale;
+            self.edit_selection(cx, EditPhase::Discrete, |a| apply_options(a, &o, scale));
         }
         tools::remember(self.tool, &self.options);
+        self.schedule_persist(cx);
     }
 
     fn zoom_to(&mut self, zoom_physical: f32, anchor: Option<PointF>) {
@@ -545,6 +675,13 @@ impl EditorView {
             (Key::Right, m) if self.selection.is_some() => self.nudge(cx, nudge_step(m), 0.0, k.repeat),
             (Key::Up, m) if self.selection.is_some() => self.nudge(cx, 0.0, -nudge_step(m), k.repeat),
             (Key::Down, m) if self.selection.is_some() => self.nudge(cx, 0.0, nudge_step(m), k.repeat),
+            (Key::Other(0xDB | 0xDD), m) if m.is_empty() || m == Modifiers::SHIFT => {
+                let notches = if m.shift { 2 } else { 1 };
+                let steps = if k.vk == 0xDB { -notches } else { notches };
+                if !self.step_width(cx, steps) {
+                    return false;
+                }
+            }
             (Key::Space, m) if m.is_empty() => {
                 if !self.space_held {
                     self.space_held = true;
@@ -676,6 +813,7 @@ impl EditorView {
                 cx.request_paint();
             }
             TIMER_AUTOCOPY => self.autocopy(cx),
+            TIMER_PERSIST => tools::persist(),
             _ => {}
         }
     }
@@ -688,21 +826,62 @@ impl EditorView {
     }
 }
 
+/// A stroke setting as a tool default (`kind` picks which caps a cap change edits).
+fn apply_stroke_to_options(o: &mut ToolOptions, change: StrokeChange, kind: ShapeKind, image_scale: f32) {
+    match change {
+        StrokeChange::Width(px) => o.width = px / image_scale,
+        StrokeChange::Opacity(v) => o.opacity = v,
+        StrokeChange::Dash(d) => o.dash = d,
+        StrokeChange::Pressure(on) => o.pressure = on,
+        StrokeChange::Smoothing(v) => o.smoothing = v,
+        StrokeChange::Cap(end, cap) => {
+            let mut caps = o.caps(kind);
+            caps[end.min(1)] = cap;
+            o.set_caps(kind, caps);
+        }
+        StrokeChange::HeadScale(v) => o.head_scale = v,
+        StrokeChange::CornerRadius(px) => o.corner_radius = px / image_scale,
+        StrokeChange::FillOpacity(v) => o.fill_opacity = v,
+    }
+    *o = o.sanitized();
+}
+
+/// A stroke setting applied to an object (settings that do not apply to it are ignored).
+fn apply_stroke_to_annotation(a: &mut Annotation, change: StrokeChange) {
+    match (&mut a.body, change) {
+        (Body::Stroke(s), StrokeChange::Width(px)) => s.width = px,
+        (Body::Shape(s), StrokeChange::Width(px)) => s.width = px,
+        (Body::Stroke(s), StrokeChange::Opacity(v)) => s.opacity = v,
+        (Body::Shape(s), StrokeChange::Opacity(v)) => s.opacity = v,
+        (Body::Stroke(s), StrokeChange::Dash(d)) if s.kind == StrokeKind::Pen => s.dash = d,
+        (Body::Shape(s), StrokeChange::Dash(d)) => s.dash = d,
+        (Body::Stroke(s), StrokeChange::Pressure(on)) => s.pressure = on,
+        (Body::Stroke(s), StrokeChange::Smoothing(v)) => s.smoothing = v,
+        (Body::Shape(s), StrokeChange::Cap(end, cap)) => s.caps[end.min(1)] = cap,
+        (Body::Shape(s), StrokeChange::HeadScale(v)) => s.head_scale = v,
+        (Body::Shape(s), StrokeChange::CornerRadius(px)) => s.corner_radius = px,
+        (Body::Shape(s), StrokeChange::FillOpacity(v)) => s.fill_opacity = v,
+        _ => {}
+    }
+}
+
 fn nudge_step(mods: Modifiers) -> f32 {
     if mods.shift { 10.0 } else { 1.0 }
 }
 
-/// Writes tool options into an annotation (color, width, kind, fill, text size, redaction kind).
-fn apply_options(a: &mut crate::model::Annotation, o: &ToolOptions, image_scale: f32) {
+/// Writes the options pill's settings into an annotation (color, width, kind, fill, text size, redaction kind).
+fn apply_options(a: &mut Annotation, o: &ToolOptions, image_scale: f32) {
     match &mut a.body {
         Body::Stroke(s) => {
             s.color = o.color;
-            let tool = if s.kind == StrokeKind::Highlighter { Tool::Highlighter } else { Tool::Pen };
-            s.width = o.width_dip(tool) * image_scale;
+            s.width = o.width * image_scale;
         }
         Body::Shape(s) => {
+            if s.kind != o.shape {
+                s.caps = o.caps(o.shape);
+            }
             s.color = o.color;
-            s.width = o.width_dip(Tool::Shapes) * image_scale;
+            s.width = o.width * image_scale;
             s.kind = o.shape;
             s.filled = o.filled;
         }

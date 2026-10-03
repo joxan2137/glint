@@ -1,5 +1,6 @@
 //! Everything around the canvas: the unified title bar (New, tool pill, actions), the crop pill, the tool-options
-//! pill, the bottom zoom pill, the OCR bar, the HDR and color popovers, the mode/delay menu and toasts.
+//! pill (with the stroke button), the bottom zoom pill, the OCR bar, the HDR, color and stroke popovers, the
+//! mode/delay menu and toasts.
 
 use glint_core::{CaptureMode, PointF, RectF, SizeF, ToneMapMode};
 use glint_ui::anim::{Motion, Spring, Tween};
@@ -10,10 +11,15 @@ use glint_ui::widgets::{
 use std::rc::Rc;
 
 use glint_core::Image;
-use glint_ui::{Animated, Backdrop, Bitmap, Color, Ctx, Event, Gfx, Icon, Painter, TextAlign, TextStyle, Theme, Weight};
+use glint_ui::{
+    Animated, Backdrop, Bitmap, Color, Ctx, Event, Gfx, Icon, LineCap, LineJoin, Painter, PathBuilder, TextAlign,
+    TextStyle, Theme, Weight,
+};
 
 use crate::color_picker::{self, ColorPicker};
-use crate::model::{RedactKind, ShapeKind};
+use crate::model::{Dash, RedactKind, ShapeKind};
+use crate::render;
+use crate::stroke_panel::{self, StrokeChange, StrokePanel, StrokeSpec, StrokeTarget};
 use crate::tools::{self, OptionGroups, PALETTE, PALETTE_NAMES, SIZE_DOTS, Tool, ToolOptions};
 
 pub const TITLE_BAR: f32 = 52.0;
@@ -69,6 +75,10 @@ pub struct ChromeState {
     pub ocr: OcrBar,
     pub mode: CaptureMode,
     pub delay: u32,
+    /// The stroke the stroke button and popover show (tool defaults or the selected object), in image pixels.
+    pub stroke: Option<StrokeSpec>,
+    /// The size preset dot matching the stroke width; None for a custom width.
+    pub preset: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -101,6 +111,10 @@ pub enum ChromeAction {
     Exposure { value: f32, done: bool },
     OcrCopyAll,
     OcrClose,
+    /// From the stroke popover; `done` = false while a slider is still being dragged.
+    Stroke { change: StrokeChange, done: bool },
+    /// Width up or down along the width ladder (wheel over the stroke button).
+    WidthStep(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +200,11 @@ pub struct Chrome {
     exposure_dragging: bool,
     picker_popover: Popover,
     picker: ColorPicker,
+    stroke_button: HotSpot,
+    stroke_popover: Popover,
+    stroke_panel: StrokePanel,
+    /// Fractional wheel notches (precision touchpads) not yet turned into width steps.
+    wheel_notches: f32,
     toast: Option<Toast>,
     toast_progress: Animated<f32>,
     spinner_phase: f32,
@@ -217,7 +236,7 @@ fn key_label(key: char) -> &'static str {
     KEYS.get((key as u8).wrapping_sub(b'A') as usize).copied().unwrap_or("")
 }
 
-fn options_toolbar(tool: Tool, groups: OptionGroups, o: &ToolOptions) -> Toolbar {
+fn options_toolbar(tool: Tool, groups: OptionGroups, o: &ToolOptions, preset: Option<usize>) -> Toolbar {
     let mut items = Vec::new();
     let separate = |items: &mut Vec<ToolbarItem>| {
         if !items.is_empty() {
@@ -231,7 +250,12 @@ fn options_toolbar(tool: Tool, groups: OptionGroups, o: &ToolOptions) -> Toolbar
         separate(&mut items);
         let names = ["Thin", "Medium", "Thick"];
         let dots = (0..3).map(|i| Segment::dot(SIZE_DOTS[i]).tooltip(names[i], None)).collect();
-        items.push(ToolbarItem::segmented("size", Segmented::new(dots, o.size)));
+        let mut sizes = Segmented::new(dots, preset.unwrap_or(1));
+        if preset.is_none() {
+            sizes.clear_selection();
+        }
+        items.push(ToolbarItem::segmented("size", sizes));
+        items.push(ToolbarItem::custom("stroke", SizeF::new(36.0, 32.0)));
     }
     if groups.text_size {
         separate(&mut items);
@@ -349,6 +373,10 @@ impl Chrome {
             exposure_dragging: false,
             picker_popover: Popover::new(color_picker::content_size()),
             picker: ColorPicker::new(Color::hex("#5AC8FA").unwrap_or(Color::WHITE)),
+            stroke_button: HotSpot::tip("Stroke", Some("[ ]")),
+            stroke_popover: Popover::new(SizeF::new(stroke_panel::WIDTH, stroke_panel::content_height(2))),
+            stroke_panel: StrokePanel::new(),
+            wheel_notches: 0.0,
             toast: None,
             toast_progress: Animated::new(0.0),
             spinner_phase: 0.0,
@@ -422,7 +450,7 @@ impl Chrome {
         if target != self.options_key {
             match target {
                 Some((tool, groups)) => {
-                    self.options = options_toolbar(tool, groups, &state.options);
+                    self.options = options_toolbar(tool, groups, &state.options, state.preset);
                     self.options.snap_visible(first);
                     self.options.set_visible(true);
                     self.options_presence.snap(first);
@@ -446,9 +474,21 @@ impl Chrome {
                 self.picker_popover.close();
             }
         }
+        match state.stroke {
+            Some(spec) => {
+                if self.stroke_panel.sync(spec) {
+                    self.stroke_popover.set_content_size(self.stroke_panel.content_size());
+                    self.reanchor_stroke_popover();
+                }
+            }
+            None => self.stroke_popover.close(),
+        }
         let o = &state.options;
         if let Some(s) = self.options.segmented_mut("size") {
-            s.set_selected(o.size);
+            match state.preset {
+                Some(i) => s.set_selected(i),
+                None => s.clear_selection(),
+            }
         }
         if let Some(s) = self.options.segmented_mut("tsize") {
             s.set_selected(o.text_size);
@@ -521,6 +561,8 @@ impl Chrome {
                 swatch.set_center(item.rect().center());
             }
         }
+        self.stroke_button.rect = self.options.item("stroke").map(|i| i.rect()).unwrap_or_default();
+        self.reanchor_stroke_popover();
 
         let bottom_y = size.h - BOTTOM_GAP - PILL_H;
         self.bottom.layout_centered(gfx, size.w / 2.0, bottom_y);
@@ -600,12 +642,29 @@ impl Chrome {
             || (self.ocr_presence.is_shown() && self.ocr_rect.contains(pos))
             || (self.hdr_popover.is_open() && self.hdr_popover.frame().contains(pos))
             || (self.picker_popover.is_open() && self.picker_popover.frame().contains(pos))
+            || (self.stroke_popover.is_open() && self.stroke_popover.frame().contains(pos))
             || (self.menu.is_open() && self.menu.frame().contains(pos))
     }
 
     /// Something modal (menu, popover) is open and should see keys first.
     pub fn has_popup(&self) -> bool {
-        self.menu.is_open() || self.hdr_popover.is_open() || self.picker_popover.is_open()
+        self.menu.is_open() || self.hdr_popover.is_open() || self.picker_popover.is_open() || self.stroke_popover.is_open()
+    }
+
+    fn reanchor_stroke_popover(&mut self) {
+        if self.stroke_popover.is_open() && self.stroke_button.rect.w > 0.0 {
+            self.stroke_popover.open(self.stroke_button.rect, self.size);
+        }
+    }
+
+    fn toggle_stroke_popover(&mut self) {
+        if self.stroke_popover.is_open() {
+            self.stroke_popover.close();
+        } else if self.stroke_panel.spec().is_some() {
+            self.picker_popover.close();
+            self.stroke_popover.set_content_size(self.stroke_panel.content_size());
+            self.stroke_popover.open(self.stroke_button.rect, self.size);
+        }
     }
 
     pub fn bottom_rect(&self) -> RectF {
@@ -636,6 +695,13 @@ impl Chrome {
     pub fn force_hdr_popover(&mut self) {
         if let Some(anchor) = self.hdr_anchor() {
             self.hdr_popover.force_open(anchor, self.size);
+        }
+    }
+
+    pub fn force_stroke_popover(&mut self) {
+        if self.stroke_panel.spec().is_some() && self.stroke_button.rect.w > 0.0 {
+            self.stroke_popover.set_content_size(self.stroke_panel.content_size());
+            self.stroke_popover.force_open(self.stroke_button.rect, self.size);
         }
     }
 
@@ -679,6 +745,18 @@ impl Chrome {
                 Response::Ignored => {}
             }
             if self.picker_popover.event(cx, event).consumed() {
+                return Response::Consumed;
+            }
+        }
+        if self.stroke_popover.is_open() {
+            self.stroke_panel.layout(cx.gfx(), self.stroke_popover.content_rect());
+            match self.stroke_panel.event(cx, event) {
+                Response::Action((change, done)) => return Response::Action(ChromeAction::Stroke { change, done }),
+                Response::Consumed => return Response::Consumed,
+                Response::Ignored => {}
+            }
+            let on_button = event.pointer_pos().is_some_and(|p| self.stroke_button.rect.contains(p));
+            if !on_button && self.stroke_popover.event(cx, event).consumed() {
                 return Response::Consumed;
             }
         }
@@ -787,6 +865,20 @@ impl Chrome {
         if !self.options.is_visible() {
             return Response::Ignored;
         }
+        if self.stroke_button.rect.w > 0.0 {
+            if let Event::Wheel(w) = event
+                && self.stroke_button.rect.contains(w.pos)
+            {
+                self.wheel_notches += w.delta.y;
+                let steps = self.wheel_notches.trunc() as i32;
+                self.wheel_notches -= steps as f32;
+                return if steps != 0 { Response::Action(ChromeAction::WidthStep(steps)) } else { Response::Consumed };
+            }
+            if self.stroke_button.event(cx, event).action().is_some() {
+                self.toggle_stroke_popover();
+                return Response::Consumed;
+            }
+        }
         for (i, swatch) in self.swatches.iter_mut().enumerate() {
             if swatch.event(cx, event).action().is_some() {
                 if i < 8 {
@@ -796,6 +888,7 @@ impl Chrome {
                     if self.picker_popover.is_open() {
                         self.picker_popover.close();
                     } else {
+                        self.stroke_popover.close();
                         self.picker_popover.open(anchor, self.size);
                     }
                 }
@@ -918,6 +1011,8 @@ impl Chrome {
             picker.set_rect(r);
             picker.paint(p);
         });
+        let panel = &mut self.stroke_panel;
+        self.stroke_popover.paint(p, Some(&backdrop), |p, r| panel.paint(p, r));
         self.menu.paint(p, Some(&backdrop));
     }
 
@@ -941,9 +1036,21 @@ impl Chrome {
         let cells: Vec<RectF> =
             self.options.segmented_mut("tsize").map(|s| (0..3).filter_map(|i| s.item_rect(i)).collect()).unwrap_or_default();
         let text_size = state.options.text_size;
+        let stroke_button = &self.stroke_button;
+        let stroke_open = self.stroke_popover.is_open();
         self.options_presence.paint(p, PointF::new(rect.center().x, rect.y), |p| {
             for swatch in swatches.iter_mut() {
                 swatch.paint(p);
+            }
+            if let Some(spec) = state.stroke
+                && stroke_button.rect.w > 0.0
+            {
+                let theme = p.theme().clone();
+                let background = if stroke_open { theme.selected } else { stroke_button.highlight(p) };
+                if background.a > 0.0 {
+                    p.fill_round_rect(p.snap_rect(stroke_button.rect), 8.0, background);
+                }
+                paint_stroke_glyph(p, stroke_button.rect, &spec);
             }
             let theme = p.theme().clone();
             for (i, cell) in cells.iter().enumerate() {
@@ -1035,6 +1142,31 @@ impl Chrome {
             });
         });
     }
+}
+
+/// The stroke button's live sample: an S-curve in the stroke's color, opacity and dash, its weight following the
+/// width on a log scale.
+fn paint_stroke_glyph(p: &mut Painter, cell: RectF, spec: &StrokeSpec) {
+    let weight = 1.25 + 5.0 * stroke_panel::width_to_slider(spec.width_dip());
+    let c = cell.center();
+    let mut curve = PathBuilder::new();
+    curve.move_to(PointF::new(c.x - 9.0, c.y + 5.0));
+    curve.cubic_to(PointF::new(c.x - 3.0, c.y - 9.0), PointF::new(c.x + 3.0, c.y + 9.0), PointF::new(c.x + 9.0, c.y - 5.0));
+    let Ok(path) = curve.build(p.gfx()) else { return };
+    let ink = spec.color;
+    let theme = p.theme().clone();
+    let invisible = if theme.is_dark() { ink.luminance() < 0.04 } else { ink.luminance() > 0.85 };
+    if invisible {
+        let halo = render::line_style(Dash::Solid, LineCap::Round, LineJoin::Round);
+        p.stroke_path(&path, theme.text_tertiary, weight + 1.5, &halo);
+    }
+    let (dash, cap) = match spec.target {
+        StrokeTarget::Highlighter => (Dash::Solid, LineCap::Flat),
+        _ => (spec.dash, LineCap::Round),
+    };
+    p.layer(0.45 + 0.55 * spec.opacity, |p| {
+        p.stroke_path(&path, ink, weight, &render::line_style(dash, cap, LineJoin::Round));
+    });
 }
 
 fn paint_spinner(p: &mut Painter, center: PointF, phase: f32) {

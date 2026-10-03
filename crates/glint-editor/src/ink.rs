@@ -1,10 +1,10 @@
-//! Ink geometry: input filtering, centripetal Catmull-Rom → cubic Bézier smoothing, pressure-driven outlines with
-//! round caps, and arrow heads.
+//! Ink geometry: input filtering, adjustable smoothing, centripetal Catmull-Rom → cubic Bézier curves,
+//! pressure-driven outlines with round caps, and line caps (arrowheads, dots).
 
 use glint_core::PointF;
 
-use crate::math::Vec2;
-use crate::model::InkPoint;
+use crate::math::{Vec2, clamp_safe};
+use crate::model::{Cap, InkPoint};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cubic {
@@ -61,16 +61,26 @@ pub fn simplify(points: &[InkPoint], min_distance: f32) -> Vec<InkPoint> {
     out
 }
 
-/// One pass of [1 2 1]/4 smoothing on positions and three on pressure; endpoints stay put.
-pub fn relax(points: &mut [InkPoint]) {
+/// Most [1 2 1]/4 position passes `smoothing` = 100 applies.
+const MAX_SMOOTHING_PASSES: f32 = 4.0;
+
+/// One [1 2 1]/4 pass on positions blended in by `amount` (0..=1); endpoints stay put.
+fn relax_positions(points: &mut [InkPoint], amount: f32) {
+    let n = points.len();
+    if n < 3 || amount <= 0.0 {
+        return;
+    }
+    let original: Vec<PointF> = points.iter().map(|p| p.pos).collect();
+    for i in 1..n - 1 {
+        let relaxed = original[i - 1].plus(original[i].times(2.0)).plus(original[i + 1]).times(0.25);
+        points[i].pos = original[i].lerp_to(relaxed, amount);
+    }
+}
+
+fn relax_pressure(points: &mut [InkPoint]) {
     let n = points.len();
     if n < 3 {
         return;
-    }
-    let original: Vec<InkPoint> = points.to_vec();
-    for i in 1..n - 1 {
-        let (a, b, c) = (original[i - 1].pos, original[i].pos, original[i + 1].pos);
-        points[i].pos = a.plus(b.times(2.0)).plus(c).times(0.25);
     }
     for _ in 0..3 {
         let pressures: Vec<f32> = points.iter().map(|p| p.pressure).collect();
@@ -80,11 +90,18 @@ pub fn relax(points: &mut [InkPoint]) {
     }
 }
 
-/// The processing every finished stroke goes through.
-pub fn finalize(raw: &[InkPoint], min_distance: f32) -> Vec<InkPoint> {
-    let mut points = simplify(raw, min_distance);
-    relax(&mut points);
-    points
+/// The samples the curve goes through: positions relaxed by `smoothing` (0..=100, up to four passes, the last one
+/// partial so the slider is continuous) and pressure always lightly smoothed. Endpoints never move.
+pub fn smoothed(points: &[InkPoint], smoothing: f32) -> Vec<InkPoint> {
+    let mut out = points.to_vec();
+    let passes = clamp_safe(smoothing, 0.0, 100.0) / 100.0 * MAX_SMOOTHING_PASSES;
+    let mut remaining = passes;
+    while remaining > 0.0 {
+        relax_positions(&mut out, remaining.min(1.0));
+        remaining -= 1.0;
+    }
+    relax_pressure(&mut out);
+    out
 }
 
 /// Centripetal (α = 0.5) Catmull-Rom spline through `points` as cubic Béziers; no cusps or overshoot on uneven
@@ -200,34 +217,89 @@ fn circle(center: PointF, radius: f32) -> Vec<PointF> {
         .collect()
 }
 
-/// Arrow geometry: the shaft ends inside the head so the joint never shows.
+/// A cap at one end of a line.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Arrow {
-    pub shaft_start: PointF,
-    pub shaft_end: PointF,
-    /// Tip, left wing, back notch, right wing.
-    pub head: [PointF; 4],
-    /// Stroke width that rounds the head's corners.
-    pub corner_round: f32,
+pub enum Head {
+    /// Apple-style filled arrowhead: tip, wing, back notch, wing; corners rounded by stroking at `round`.
+    Filled { points: [PointF; 4], round: f32 },
+    /// Open chevron: wing, tip, wing, stroked at the line width with round joins.
+    Open([PointF; 3]),
+    Dot { center: PointF, radius: f32 },
 }
 
-/// Apple-style filled head: length and wing span proportional to the stroke width, a shallow swallowtail notch,
-/// scaled down on short arrows so the head never swallows the shaft.
-pub fn arrow(start: PointF, end: PointF, width: f32) -> Arrow {
+/// A line's shaft (trimmed so it ends inside its caps) and its caps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineGeometry {
+    pub shaft: (PointF, PointF),
+    pub heads: Vec<Head>,
+}
+
+impl LineGeometry {
+    /// Every point the geometry reaches (dots contribute their extremes), for bounds.
+    pub fn points(&self) -> Vec<PointF> {
+        let mut out = vec![self.shaft.0, self.shaft.1];
+        for head in &self.heads {
+            match head {
+                Head::Filled { points, .. } => out.extend(points),
+                Head::Open(points) => out.extend(points),
+                Head::Dot { center, radius } => {
+                    out.extend([PointF::new(center.x - radius, center.y - radius), PointF::new(center.x + radius, center.y + radius)])
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Filled arrowhead length for a stroke width at `scale` 1.
+pub fn filled_head_length(width: f32) -> f32 {
+    width * 3.4 + 6.0
+}
+
+/// Caps proportional to the stroke width (times `head_scale`), never longer than 45 % of the line each (60 % when
+/// only one end has a cap), so heads never swallow the shaft. The shaft is trimmed to end inside each cap.
+pub fn line_geometry(start: PointF, end: PointF, width: f32, caps: [Cap; 2], head_scale: f32) -> LineGeometry {
     let span = end.minus(start);
     let length = span.length();
     let dir = if length > 1e-4 { span.times(1.0 / length) } else { PointF::new(1.0, 0.0) };
-    let head_length = (width * 3.4 + 6.0).min(length * 0.55).max(width * 1.2);
-    let wing = head_length * 0.56;
-    let side = dir.perp();
-    let base = end.minus(dir.times(head_length));
-    let notch = end.minus(dir.times(head_length * 0.74));
-    Arrow {
-        shaft_start: start,
-        shaft_end: notch.plus(dir.times(width * 0.5)),
-        head: [end, base.plus(side.times(wing)), notch, base.minus(side.times(wing))],
-        corner_round: width * 0.35,
+    let capped = caps.iter().filter(|c| **c != Cap::None).count();
+    let limit = length * if capped == 2 { 0.45 } else { 0.6 };
+    let scale = clamp_safe(head_scale, 0.25, 4.0);
+    let mut shaft = [start, end];
+    let mut heads = Vec::new();
+    for (index, cap) in caps.iter().enumerate() {
+        let (tip, outward) = if index == 0 { (start, dir.times(-1.0)) } else { (end, dir) };
+        let side = outward.perp();
+        match cap {
+            Cap::None => {}
+            Cap::FilledArrow => {
+                let head = clamp_safe(filled_head_length(width) * scale, (width * 1.2).min(limit), limit);
+                let wing = head * 0.56;
+                let base = tip.minus(outward.times(head));
+                let notch = tip.minus(outward.times(head * 0.74));
+                heads.push(Head::Filled {
+                    points: [tip, base.plus(side.times(wing)), notch, base.minus(side.times(wing))],
+                    round: width * 0.35,
+                });
+                shaft[index] = notch.plus(outward.times(width * 0.5));
+            }
+            Cap::Arrow => {
+                let head = clamp_safe((width * 2.6 + 6.0) * scale, (width * 1.2).min(limit), limit);
+                let base = tip.minus(outward.times(head));
+                let wing = head * 0.62;
+                heads.push(Head::Open([base.plus(side.times(wing)), tip, base.minus(side.times(wing))]));
+                shaft[index] = tip.minus(outward.times(width * 0.5));
+            }
+            Cap::Dot => {
+                heads.push(Head::Dot { center: tip, radius: (width * 1.4 + 1.5) * scale });
+            }
+        }
     }
+    if shaft[1].minus(shaft[0]).dot(dir) < 0.0 {
+        let middle = shaft[0].lerp_to(shaft[1], 0.5);
+        shaft = [middle, middle];
+    }
+    LineGeometry { shaft: (shaft[0], shaft[1]), heads }
 }
 
 #[cfg(test)]
@@ -290,15 +362,25 @@ mod tests {
     }
 
     #[test]
-    fn relax_smooths_a_zigzag_and_pins_ends() {
-        let mut pts: Vec<InkPoint> =
-            (0..9).map(|i| InkPoint::new(i as f32, if i % 2 == 0 { 0.0 } else { 2.0 }, 0.5)).collect();
-        let (first, last) = (pts[0].pos, pts[8].pos);
-        relax(&mut pts);
-        assert_eq!(pts[0].pos, first);
-        assert_eq!(pts[8].pos, last);
-        for p in &pts[1..8] {
-            assert!((p.pos.y - 1.0).abs() <= 0.5 + 1e-6);
+    fn smoothing_reduces_roughness_continuously_and_pins_ends() {
+        let pts: Vec<InkPoint> = (0..24)
+            .map(|i| {
+                let jitter = if i % 2 == 0 { 1.5 } else { -1.5 };
+                InkPoint::new(i as f32 * 3.0, (i as f32 * 0.5).sin() * 10.0 + jitter, 0.5)
+            })
+            .collect();
+        let roughness = |points: &[InkPoint]| {
+            points.windows(3).map(|w| w[0].pos.minus(w[1].pos.times(2.0)).plus(w[2].pos).length()).sum::<f32>()
+        };
+        let raw = smoothed(&pts, 0.0);
+        assert_eq!(raw.iter().map(|p| p.pos).collect::<Vec<_>>(), pts.iter().map(|p| p.pos).collect::<Vec<_>>());
+        let (half, light, strong) = (smoothed(&pts, 12.5), smoothed(&pts, 25.0), smoothed(&pts, 100.0));
+        assert!(roughness(&half) < roughness(&raw));
+        assert!(roughness(&light) < roughness(&half), "fractional passes blend continuously");
+        assert!(roughness(&strong) < roughness(&light));
+        for out in [&half, &light, &strong] {
+            assert_eq!(out[0].pos, pts[0].pos);
+            assert_eq!(out[23].pos, pts[23].pos);
         }
     }
 
@@ -324,16 +406,61 @@ mod tests {
         assert!(dot.iter().all(|p| (p.distance(PointF::new(5.0, 5.0)) - r).abs() < 1e-4));
     }
 
+    fn filled(g: &LineGeometry, i: usize) -> [PointF; 4] {
+        match g.heads[i] {
+            Head::Filled { points, .. } => points,
+            other => panic!("expected a filled head, got {other:?}"),
+        }
+    }
+
+    const ARROW: [Cap; 2] = [Cap::None, Cap::FilledArrow];
+
     #[test]
-    fn arrow_head_scales_with_width_and_stays_on_axis() {
-        let thin = arrow(PointF::new(0.0, 0.0), PointF::new(300.0, 0.0), 2.0);
-        let thick = arrow(PointF::new(0.0, 0.0), PointF::new(300.0, 0.0), 8.0);
-        let len = |a: &Arrow| a.head[0].x - a.head[1].x;
+    fn plain_lines_have_no_heads() {
+        let g = line_geometry(PointF::new(0.0, 0.0), PointF::new(100.0, 0.0), 4.0, [Cap::None, Cap::None], 1.0);
+        assert_eq!(g.shaft, (PointF::new(0.0, 0.0), PointF::new(100.0, 0.0)));
+        assert!(g.heads.is_empty());
+    }
+
+    #[test]
+    fn filled_head_scales_with_width_and_size_and_stays_on_axis() {
+        let (a, b) = (PointF::new(0.0, 0.0), PointF::new(300.0, 0.0));
+        let len = |g: &LineGeometry| filled(g, 0)[0].x - filled(g, 0)[1].x;
+        let thin = line_geometry(a, b, 2.0, ARROW, 1.0);
+        let thick = line_geometry(a, b, 8.0, ARROW, 1.0);
+        let big = line_geometry(a, b, 2.0, ARROW, 2.0);
         assert!(len(&thick) > len(&thin) * 2.0);
-        assert_eq!(thin.head[0], PointF::new(300.0, 0.0));
-        assert!((thin.head[1].y + thin.head[3].y).abs() < 1e-4, "wings are symmetric");
-        assert!(thin.shaft_end.x < thin.head[0].x && thin.shaft_end.x > thin.head[2].x);
-        let short = arrow(PointF::new(0.0, 0.0), PointF::new(20.0, 0.0), 8.0);
-        assert!(short.head[0].x - short.head[1].x <= 20.0 * 0.55 + 1e-4);
+        assert!((len(&big) - 2.0 * len(&thin)).abs() < 1e-3, "head size multiplies the length");
+        let head = filled(&thin, 0);
+        assert_eq!(head[0], b);
+        assert!((head[1].y + head[3].y).abs() < 1e-4, "wings are symmetric");
+        assert!(thin.shaft.1.x < head[0].x && thin.shaft.1.x > head[2].x, "the shaft ends inside the head");
+        let short = line_geometry(a, PointF::new(20.0, 0.0), 8.0, ARROW, 1.0);
+        assert!(filled(&short, 0)[0].x - filled(&short, 0)[1].x <= 20.0 * 0.6 + 1e-4);
+    }
+
+    #[test]
+    fn caps_point_outward_at_both_ends() {
+        let (a, b) = (PointF::new(0.0, 0.0), PointF::new(0.0, 200.0));
+        let g = line_geometry(a, b, 4.0, [Cap::FilledArrow, Cap::Arrow], 1.0);
+        assert_eq!(filled(&g, 0)[0], a);
+        assert!(filled(&g, 0)[1].y > a.y, "the start head's wings lie inside the line");
+        let Head::Open(chevron) = g.heads[1] else { panic!("open head expected") };
+        assert_eq!(chevron[1], b);
+        assert!(chevron[0].y < b.y && chevron[2].y < b.y);
+        assert!(g.shaft.0.y > a.y && g.shaft.1.y < b.y);
+    }
+
+    #[test]
+    fn dots_scale_with_width_and_heads_never_cross_on_short_lines() {
+        let g = line_geometry(PointF::new(0.0, 0.0), PointF::new(100.0, 0.0), 4.0, [Cap::Dot, Cap::None], 1.0);
+        let Head::Dot { center, radius } = g.heads[0] else { panic!("dot expected") };
+        assert_eq!(center, PointF::new(0.0, 0.0));
+        let wider = line_geometry(PointF::new(0.0, 0.0), PointF::new(100.0, 0.0), 8.0, [Cap::Dot, Cap::None], 1.0);
+        let Head::Dot { radius: wider_radius, .. } = wider.heads[0] else { panic!("dot expected") };
+        assert!(wider_radius > radius * 1.5);
+        let tiny = line_geometry(PointF::new(0.0, 0.0), PointF::new(10.0, 0.0), 6.0, [Cap::FilledArrow; 2], 2.0);
+        assert!(tiny.shaft.0.x <= tiny.shaft.1.x, "trimmed ends never cross");
+        assert!(filled(&tiny, 0)[1].x <= filled(&tiny, 1)[1].x + 1e-4);
     }
 }

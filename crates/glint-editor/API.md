@@ -42,6 +42,16 @@ remembered per tool on the UI thread for the next editor window.
   and light at scale 1 and 2, plus `export.png` and `export-cropped.png`. No window.
 - `gfx` must be owned by an `Rc` (`Gfx::new()`); previews use `Gfx::shared()`.
 
+## Stroke customization
+The options pill keeps three size presets (none is selected for a custom width) plus a stroke button with a live
+sample; it opens the Stroke popover: preview, Width 1–64 px (image px, log slider), Opacity 10–100 %, Style
+Solid/Dashed/Dotted (pattern in multiples of the width, round caps), Pen pressure + Smoothing 0–100, Line/Arrow start
+and end caps (None/Arrow/Filled arrow/Dot) + Arrowhead 50–200 %, Rectangle corner radius, Fill opacity when filled;
+the highlighter gets width and opacity only. `[` / `]` (Shift: two steps) and the wheel over the button step the
+width. Edits apply to the selected object (one undo step per slider drag) or else to the tool's defaults, which persist
+in `editor.json` beside the settings file (`settings_store::settings_path()`; missing, corrupt or partial files fall
+back per field). Every object draws inside one group layer at its opacity, so canvas, export and the preview match.
+
 ## Behaviour summary
 Tools V P H E S T B C; Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, Ctrl+C, Ctrl+S, Ctrl+Shift+S, Ctrl+N, Ctrl+W, Ctrl+0 fit,
 Ctrl+1 100 %, Ctrl+± zoom, Ctrl+wheel/pinch zoom about the cursor, wheel/trackpad/Space-drag/middle-drag pan,

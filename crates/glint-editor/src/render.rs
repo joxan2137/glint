@@ -13,11 +13,39 @@ use glint_ui::{
     TextStyle, Theme, Weight, render_offscreen,
 };
 
-use crate::ink;
-use crate::model::{Annotation, Body, Document, RedactKind, Redaction, Shape, ShapeKind, Stroke, StrokeKind, TextMeasure, TextNote};
+use crate::ink::{self, Head};
+use crate::model::{
+    Annotation, Body, Dash, Document, RedactKind, Redaction, Shape, ShapeKind, Stroke, StrokeKind, TextMeasure, TextNote,
+};
 use crate::pixels;
 
-pub const HIGHLIGHTER_OPACITY: f32 = 0.4;
+/// Dash and gap lengths in multiples of the stroke width (Direct2D scales them with it); round caps add half a width
+/// to each end of a dash.
+pub const DASHED: [f32; 2] = [2.0, 2.5];
+/// Zero-length dashes with round caps: dots one width across, two widths apart.
+pub const DOTTED: [f32; 2] = [0.0, 2.0];
+
+/// The dash pattern for `dash`, in multiples of the width.
+pub fn dash_pattern(dash: Dash) -> &'static [f32] {
+    match dash {
+        Dash::Solid => &[],
+        Dash::Dashed => &DASHED,
+        Dash::Dotted => &DOTTED,
+    }
+}
+
+/// Dash and gap lengths in image pixels for a stroke `width` wide.
+#[cfg(test)]
+pub fn dash_lengths(dash: Dash, width: f32) -> Vec<f32> {
+    dash_pattern(dash).iter().map(|d| d * width).collect()
+}
+
+/// Stroke style for `dash`: dashes and dots always get round caps; solid lines keep `cap`.
+pub fn line_style(dash: Dash, cap: LineCap, join: LineJoin) -> StrokeStyle {
+    let dashes = dash_pattern(dash).to_vec();
+    let cap = if dashes.is_empty() { cap } else { LineCap::Round };
+    StrokeStyle { cap, join, dashes, dash_offset: 0.0 }
+}
 
 pub fn note_style(size: f32) -> TextStyle {
     TextStyle::new(size).weight(Weight::Medium)
@@ -60,7 +88,9 @@ fn stroke_fingerprint(stroke: &Stroke) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     (stroke.kind == StrokeKind::Pen).hash(&mut h);
     stroke.pressure.hash(&mut h);
+    stroke.dash.hash(&mut h);
     stroke.width.to_bits().hash(&mut h);
+    stroke.smoothing.to_bits().hash(&mut h);
     for p in &stroke.points {
         p.pos.x.to_bits().hash(&mut h);
         p.pos.y.to_bits().hash(&mut h);
@@ -135,18 +165,28 @@ pub fn paint_base(p: &mut Painter, scene: &Scene, interpolation: Interpolation) 
 /// Every annotation in z-order. `dimmed` (the eraser's hover target) draws faded.
 pub fn paint_annotations(p: &mut Painter, doc: &Document, scene: &Scene, dimmed: Option<u64>) {
     for a in &doc.annotations {
-        let opacity = if Some(a.id) == dimmed { 0.3 } else { 1.0 };
-        p.layer(opacity, |p| paint_annotation(p, a, scene));
+        let dim = if Some(a.id) == dimmed { 0.3 } else { 1.0 };
+        paint_annotation(p, a, scene, dim);
     }
 }
 
-pub fn paint_annotation(p: &mut Painter, a: &Annotation, scene: &Scene) {
+/// Group opacity of an annotation: everything it draws is composited once, so overlaps never double up.
+pub fn opacity_of(a: &Annotation) -> f32 {
     match &a.body {
-        Body::Stroke(s) => paint_stroke(p, a.id, s, scene),
+        Body::Stroke(s) => s.opacity,
+        Body::Shape(s) => s.opacity,
+        Body::Text(_) | Body::Redact(_) => 1.0,
+    }
+    .clamp(0.0, 1.0)
+}
+
+pub fn paint_annotation(p: &mut Painter, a: &Annotation, scene: &Scene, dim: f32) {
+    p.layer(opacity_of(a) * dim, |p| match &a.body {
+        Body::Stroke(s) => paint_stroke(p, a.id, s, scene.cache),
         Body::Shape(s) => paint_shape(p, s),
         Body::Text(t) => paint_text(p, t),
         Body::Redact(r) => paint_redaction(p, r, scene),
-    }
+    });
 }
 
 fn bezier_path(p: &Painter, points: &[PointF]) -> Option<Path> {
@@ -158,15 +198,17 @@ fn bezier_path(p: &Painter, points: &[PointF]) -> Option<Path> {
     builder.build(p.gfx()).ok()
 }
 
-pub fn paint_stroke(p: &mut Painter, id: u64, stroke: &Stroke, scene: &Scene) {
+/// Draws ink without its group opacity (callers wrap it in a layer; see `paint_annotation`).
+pub fn paint_stroke(p: &mut Painter, id: u64, stroke: &Stroke, cache: &GeometryCache) {
     if stroke.points.is_empty() {
         return;
     }
     let print = stroke_fingerprint(stroke);
+    let points = || ink::smoothed(&stroke.points, stroke.smoothing);
     match stroke.kind {
-        StrokeKind::Pen if stroke.pressure => {
-            let outline = scene.cache.get_or_build(id, print, || {
-                let polygon = ink::variable_outline(&stroke.points, stroke.width, 0.75);
+        StrokeKind::Pen if stroke.pressure && stroke.dash == Dash::Solid => {
+            let outline = cache.get_or_build(id, print, || {
+                let polygon = ink::variable_outline(&points(), stroke.width, 0.75);
                 let mut builder = PathBuilder::new();
                 builder.polyline(&polygon, true);
                 builder.build(p.gfx()).ok()
@@ -180,60 +222,93 @@ pub fn paint_stroke(p: &mut Painter, id: u64, stroke: &Stroke, scene: &Scene) {
                 p.fill_circle(stroke.points[0].pos, stroke.width * 0.5, stroke.color);
                 return;
             }
-            let positions: Vec<PointF> = stroke.points.iter().map(|q| q.pos).collect();
-            if let Some(path) = scene.cache.get_or_build(id, print, || bezier_path(p, &positions)) {
-                p.stroke_path(&path, stroke.color, stroke.width, &StrokeStyle::round());
+            let path = cache.get_or_build(id, print, || {
+                let positions: Vec<PointF> = points().iter().map(|q| q.pos).collect();
+                bezier_path(p, &positions)
+            });
+            if let Some(path) = path {
+                p.stroke_path(&path, stroke.color, stroke.width, &line_style(stroke.dash, LineCap::Round, LineJoin::Round));
             }
         }
         StrokeKind::Highlighter => {
-            let positions: Vec<PointF> = stroke.points.iter().map(|q| q.pos).collect();
-            let nib = StrokeStyle { cap: LineCap::Flat, join: LineJoin::Round, ..StrokeStyle::default() };
-            p.layer(HIGHLIGHTER_OPACITY, |p| {
-                if positions.len() == 1 {
-                    let half = stroke.width * 0.5;
-                    let at = positions[0];
-                    p.fill_rect(RectF::new(at.x - half, at.y - half, stroke.width, stroke.width), stroke.color);
-                } else if let Some(path) = scene.cache.get_or_build(id, print, || bezier_path(p, &positions)) {
-                    p.stroke_path(&path, stroke.color, stroke.width, &nib);
-                }
+            if stroke.points.len() == 1 {
+                let half = stroke.width * 0.5;
+                let at = stroke.points[0].pos;
+                p.fill_rect(RectF::new(at.x - half, at.y - half, stroke.width, stroke.width), stroke.color);
+                return;
+            }
+            let path = cache.get_or_build(id, print, || {
+                let positions: Vec<PointF> = points().iter().map(|q| q.pos).collect();
+                bezier_path(p, &positions)
             });
+            if let Some(path) = path {
+                let nib = StrokeStyle { cap: LineCap::Flat, join: LineJoin::Round, ..StrokeStyle::default() };
+                p.stroke_path(&path, stroke.color, stroke.width, &nib);
+            }
         }
     }
 }
 
+/// Rectangle outline with corners rounded by `radius` (clamped to half the shorter side).
+fn rectangle_path(p: &Painter, r: RectF, radius: f32) -> Option<Path> {
+    let mut builder = PathBuilder::new();
+    let radius = radius.min(r.w * 0.5).min(r.h * 0.5);
+    if radius > 0.25 {
+        builder.round_rect(r, radius);
+    } else {
+        let corners = [PointF::new(r.x, r.y), PointF::new(r.right(), r.y), PointF::new(r.right(), r.bottom()), PointF::new(r.x, r.bottom())];
+        builder.polyline(&corners, true);
+    }
+    builder.build(p.gfx()).ok()
+}
+
+fn fill_color(s: &Shape) -> Color {
+    s.color.multiply_alpha(s.fill_opacity.clamp(0.0, 1.0))
+}
+
+/// Draws a shape without its group opacity (callers wrap it in a layer; see `paint_annotation`).
 pub fn paint_shape(p: &mut Painter, s: &Shape) {
-    let round = StrokeStyle::round();
     match s.kind {
         ShapeKind::Rectangle => {
-            let r = s.rect();
-            let corners = [PointF::new(r.x, r.y), PointF::new(r.right(), r.y), PointF::new(r.right(), r.bottom()), PointF::new(r.x, r.bottom())];
-            let mut builder = PathBuilder::new();
-            builder.polyline(&corners, true);
-            let Ok(path) = builder.build(p.gfx()) else { return };
+            let Some(path) = rectangle_path(p, s.rect(), s.corner_radius) else { return };
             if s.filled {
-                p.fill_path(&path, s.color);
+                p.fill_path(&path, fill_color(s));
             }
-            p.stroke_path(&path, s.color, s.width, &StrokeStyle { join: LineJoin::Round, ..StrokeStyle::default() });
+            p.stroke_path(&path, s.color, s.width, &line_style(s.dash, LineCap::Flat, LineJoin::Round));
         }
         ShapeKind::Ellipse => {
             let r = s.rect();
-            let (rx, ry) = (r.w * 0.5, r.h * 0.5);
-            if s.filled {
-                p.fill_ellipse(r.center(), rx + s.width * 0.5, ry + s.width * 0.5, s.color);
-            } else {
-                p.stroke_ellipse(r.center(), rx, ry, s.color, s.width);
-            }
-        }
-        ShapeKind::Line => p.line(s.start, s.end, s.color, s.width, &round),
-        ShapeKind::Arrow => {
-            let arrow = ink::arrow(s.start, s.end, s.width);
-            p.line(arrow.shaft_start, arrow.shaft_end, s.color, s.width, &round);
             let mut builder = PathBuilder::new();
-            builder.polyline(&arrow.head, true);
-            if let Ok(head) = builder.build(p.gfx()) {
-                p.fill_path(&head, s.color);
-                p.stroke_path(&head, s.color, arrow.corner_round, &round);
+            builder.ellipse(r.center(), r.w * 0.5, r.h * 0.5);
+            let Ok(path) = builder.build(p.gfx()) else { return };
+            if s.filled {
+                p.fill_path(&path, fill_color(s));
             }
+            p.stroke_path(&path, s.color, s.width, &line_style(s.dash, LineCap::Flat, LineJoin::Round));
+        }
+        ShapeKind::Line | ShapeKind::Arrow => paint_line(p, s),
+    }
+}
+
+fn paint_line(p: &mut Painter, s: &Shape) {
+    let geometry = s.line_geometry();
+    let (a, b) = geometry.shaft;
+    if a.distance(b) > 1e-3 || geometry.heads.is_empty() {
+        p.line(a, b, s.color, s.width, &line_style(s.dash, LineCap::Round, LineJoin::Round));
+    }
+    let round = StrokeStyle::round();
+    for head in &geometry.heads {
+        match head {
+            Head::Filled { points, round: corner } => {
+                let mut builder = PathBuilder::new();
+                builder.polyline(points, true);
+                if let Ok(path) = builder.build(p.gfx()) {
+                    p.fill_path(&path, s.color);
+                    p.stroke_path(&path, s.color, *corner, &round);
+                }
+            }
+            Head::Open(points) => p.polyline(points, s.color, s.width, &round, false),
+            Head::Dot { center, radius } => p.fill_circle(*center, *radius, s.color),
         }
     }
 }
@@ -324,6 +399,24 @@ mod tests {
         assert_eq!(reduced.source(RectF::new(3.0, 3.0, 6.0, 3.0)), RectF::new(1.0, 1.0, 2.0, 1.0));
         let region = Layer::region(&image, RectI::new(4, 1, 5, 2));
         assert_eq!(region.source(RectF::new(5.0, 2.0, 2.0, 1.0)), RectF::new(1.0, 1.0, 2.0, 1.0));
+    }
+
+    #[test]
+    fn dash_patterns_scale_with_width() {
+        assert!(dash_lengths(Dash::Solid, 8.0).is_empty());
+        assert_eq!(dash_lengths(Dash::Dashed, 2.0), vec![4.0, 5.0]);
+        assert_eq!(dash_lengths(Dash::Dashed, 6.0), vec![12.0, 15.0]);
+        assert_eq!(dash_lengths(Dash::Dotted, 5.0), vec![0.0, 10.0], "dots: zero-length dashes, two widths apart");
+        assert_eq!(line_style(Dash::Dotted, LineCap::Flat, LineJoin::Miter).cap, LineCap::Round, "dots need round caps");
+        assert_eq!(line_style(Dash::Solid, LineCap::Flat, LineJoin::Round).cap, LineCap::Flat);
+    }
+
+    #[test]
+    fn group_opacity_comes_from_the_object() {
+        let mut stroke = crate::model::Stroke::new(StrokeKind::Highlighter, Vec::new(), Color::BLACK, 4.0);
+        assert_eq!(opacity_of(&Annotation { id: 1, body: Body::Stroke(stroke.clone()) }), 0.4);
+        stroke.opacity = 3.0;
+        assert_eq!(opacity_of(&Annotation { id: 1, body: Body::Stroke(stroke) }), 1.0);
     }
 
     #[test]

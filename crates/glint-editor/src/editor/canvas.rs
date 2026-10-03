@@ -25,6 +25,8 @@ const HANDLE_REACH: f32 = 9.0;
 const HIT_TOLERANCE: f32 = 4.0;
 const MIN_DRAG: f32 = 4.0;
 const SELECTION_MARGIN: f32 = 4.0;
+/// Mouse samples carry mid pressure, so turning pressure on for a mouse stroke leaves it as drawn.
+const NEUTRAL_PRESSURE: f32 = 0.5;
 const WHEEL_STEP: f32 = 48.0;
 
 impl EditorView {
@@ -206,10 +208,10 @@ impl EditorView {
             Tool::Pen | Tool::Highlighter => {
                 self.select(None);
                 self.history.begin(&self.doc);
-                let pressure = self.tool == Tool::Pen && e.kind == PointerKind::Pen;
+                let pressure = self.tool == Tool::Pen && e.kind == PointerKind::Pen && self.options[Tool::Pen.index()].pressure;
                 let kind = if self.tool == Tool::Pen { StrokeKind::Pen } else { StrokeKind::Highlighter };
                 self.gesture = Gesture::Ink {
-                    raw: vec![InkPoint { pos: img, pressure: e.pressure }],
+                    raw: vec![InkPoint { pos: img, pressure: if e.kind == PointerKind::Pen { e.pressure } else { NEUTRAL_PRESSURE } }],
                     kind,
                     pressure,
                     min_distance: 0.6 * self.dip(),
@@ -226,12 +228,14 @@ impl EditorView {
                         Gesture::Shape {
                             start: img,
                             shape: Shape {
-                                kind: o.shape,
-                                start: img,
-                                end: img,
-                                color: o.color,
-                                width: o.width_dip(Tool::Shapes) * self.image_scale,
                                 filled: o.filled,
+                                opacity: o.opacity,
+                                dash: o.dash,
+                                fill_opacity: o.fill_opacity,
+                                corner_radius: o.corner_radius * self.image_scale,
+                                caps: o.caps(o.shape),
+                                head_scale: o.head_scale,
+                                ..Shape::new(o.shape, img, img, o.color, o.width * self.image_scale)
                             },
                         }
                     } else {
@@ -325,9 +329,9 @@ impl EditorView {
             Gesture::Ink { raw, .. } => {
                 let pen = e.kind == PointerKind::Pen;
                 for sample in &e.history {
-                    raw.push(InkPoint { pos: mapping.to_image(sample.pos), pressure: if pen { sample.pressure } else { 1.0 } });
+                    raw.push(InkPoint { pos: mapping.to_image(sample.pos), pressure: if pen { sample.pressure } else { NEUTRAL_PRESSURE } });
                 }
-                raw.push(InkPoint { pos: img, pressure: if pen { e.pressure } else { 1.0 } });
+                raw.push(InkPoint { pos: img, pressure: if pen { e.pressure } else { NEUTRAL_PRESSURE } });
             }
             Gesture::Shape { start, shape } => {
                 shape.end = match (shift, shape.kind.is_linear()) {
@@ -410,17 +414,10 @@ impl EditorView {
         let min_drag = MIN_DRAG * self.dip();
         match gesture {
             Gesture::Ink { raw, kind, pressure, min_distance } => {
-                let points = ink::finalize(&raw, min_distance);
+                let points = ink::simplify(&raw, min_distance);
                 if !points.is_empty() {
-                    let tool = if kind == StrokeKind::Pen { Tool::Pen } else { Tool::Highlighter };
-                    let o = self.options[tool.index()];
-                    self.doc.add(Body::Stroke(Stroke {
-                        kind,
-                        points,
-                        color: o.color,
-                        width: o.width_dip(tool) * self.image_scale,
-                        pressure,
-                    }));
+                    let stroke = self.new_stroke(kind, points, pressure);
+                    self.doc.add(Body::Stroke(stroke));
                 }
             }
             Gesture::Shape { shape, .. } => {
@@ -447,6 +444,19 @@ impl EditorView {
             self.after_change(cx);
         }
         cx.request_paint();
+    }
+
+    /// Ink with the current tool options.
+    fn new_stroke(&self, kind: StrokeKind, points: Vec<InkPoint>, pressure: bool) -> Stroke {
+        let tool = if kind == StrokeKind::Pen { Tool::Pen } else { Tool::Highlighter };
+        let o = self.options[tool.index()];
+        Stroke {
+            pressure,
+            opacity: o.opacity,
+            dash: if kind == StrokeKind::Pen { o.dash } else { crate::model::Dash::Solid },
+            smoothing: o.smoothing,
+            ..Stroke::new(kind, points, o.color, o.width * self.image_scale)
+        }
     }
 
     pub(super) fn update_hover(&mut self, cx: &mut Ctx, pos: PointF) {
@@ -613,18 +623,10 @@ impl EditorView {
     fn paint_live_gesture(&self, p: &mut Painter, scene: &Scene) {
         match &self.gesture {
             Gesture::Ink { raw, kind, pressure, min_distance } => {
-                let tool = if *kind == StrokeKind::Pen { Tool::Pen } else { Tool::Highlighter };
-                let o = self.options[tool.index()];
-                let stroke = Stroke {
-                    kind: *kind,
-                    points: ink::finalize(raw, *min_distance),
-                    color: o.color,
-                    width: o.width_dip(tool) * self.image_scale,
-                    pressure: *pressure,
-                };
-                render::paint_stroke(p, 0, &stroke, scene);
+                let stroke = self.new_stroke(*kind, ink::simplify(raw, *min_distance), *pressure);
+                p.layer(stroke.opacity, |p| render::paint_stroke(p, 0, &stroke, scene.cache));
             }
-            Gesture::Shape { shape, .. } => render::paint_shape(p, shape),
+            Gesture::Shape { shape, .. } => p.layer(shape.opacity, |p| render::paint_shape(p, shape)),
             Gesture::Redact { redaction, .. } => render::paint_redaction(p, redaction, scene),
             _ => {}
         }

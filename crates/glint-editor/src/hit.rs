@@ -2,7 +2,7 @@
 
 use glint_core::{PointF, RectF};
 
-use crate::ink;
+use crate::ink::{self, Head};
 use crate::math::{Vec2, distance_to_segment, outset};
 use crate::model::{Annotation, Body, Document, ShapeKind, StrokeKind, TextMeasure, text_bounds};
 
@@ -24,13 +24,19 @@ pub fn hit(a: &Annotation, p: PointF, tolerance: f32, measure: &dyn TextMeasure)
         Body::Shape(s) => {
             let reach = s.width * 0.5 + tolerance;
             match s.kind {
-                ShapeKind::Line => distance_to_segment(p, s.start, s.end) <= reach,
-                ShapeKind::Arrow => {
-                    let arrow = ink::arrow(s.start, s.end, s.width);
-                    let head = arrow.head;
+                ShapeKind::Line | ShapeKind::Arrow => {
                     distance_to_segment(p, s.start, s.end) <= reach
-                        || distance_to_segment(p, head[1], head[3]) <= reach
-                        || in_triangle(p, head[0], head[1], head[3])
+                        || s.line_geometry().heads.iter().any(|head| match head {
+                            Head::Filled { points, .. } => {
+                                in_triangle(p, points[0], points[1], points[3])
+                                    || distance_to_segment(p, points[1], points[3]) <= reach
+                            }
+                            Head::Open(points) => {
+                                distance_to_segment(p, points[0], points[1]) <= reach
+                                    || distance_to_segment(p, points[1], points[2]) <= reach
+                            }
+                            Head::Dot { center, radius } => center.distance(p) <= radius + tolerance,
+                        })
                 }
                 ShapeKind::Rectangle => {
                     let r = s.rect();
@@ -221,26 +227,18 @@ mod tests {
 
     use super::*;
     use crate::model::tests::FixedMeasure;
-    use crate::model::{InkPoint, Redaction, RedactKind, Shape, Stroke, TextNote};
+    use crate::model::{Cap, InkPoint, Redaction, RedactKind, Shape, Stroke, TextNote};
+
+    fn shape(kind: ShapeKind, a: (f32, f32), b: (f32, f32), width: f32) -> Shape {
+        Shape::new(kind, PointF::new(a.0, a.1), PointF::new(b.0, b.1), Color::BLACK, width)
+    }
 
     fn doc() -> (Document, u64, u64, u64) {
         let mut doc = Document::new(ToneMapParams::default());
-        let rect = doc.add(Body::Shape(Shape {
-            kind: ShapeKind::Rectangle,
-            start: PointF::new(10.0, 10.0),
-            end: PointF::new(110.0, 60.0),
-            color: Color::BLACK,
-            width: 4.0,
-            filled: false,
-        }));
+        let rect = doc.add(Body::Shape(shape(ShapeKind::Rectangle, (10.0, 10.0), (110.0, 60.0), 4.0)));
         let blur = doc.add(Body::Redact(Redaction { rect: RectF::new(50.0, 30.0, 100.0, 50.0), kind: RedactKind::Blur }));
-        let ink = doc.add(Body::Stroke(Stroke {
-            kind: StrokeKind::Pen,
-            points: vec![InkPoint::new(0.0, 100.0, 0.5), InkPoint::new(200.0, 100.0, 0.5)],
-            color: Color::BLACK,
-            width: 6.0,
-            pressure: false,
-        }));
+        let points = vec![InkPoint::new(0.0, 100.0, 0.5), InkPoint::new(200.0, 100.0, 0.5)];
+        let ink = doc.add(Body::Stroke(Stroke::new(StrokeKind::Pen, points, Color::BLACK, 6.0)));
         (doc, rect, blur, ink)
     }
 
@@ -263,32 +261,17 @@ mod tests {
 
     #[test]
     fn ellipse_and_arrow_hits() {
-        let ellipse = Annotation {
-            id: 1,
-            body: Body::Shape(Shape {
-                kind: ShapeKind::Ellipse,
-                start: PointF::new(0.0, 0.0),
-                end: PointF::new(100.0, 50.0),
-                color: Color::BLACK,
-                width: 4.0,
-                filled: false,
-            }),
-        };
+        let ellipse = Annotation { id: 1, body: Body::Shape(shape(ShapeKind::Ellipse, (0.0, 0.0), (100.0, 50.0), 4.0)) };
         assert!(hit(&ellipse, PointF::new(100.0, 25.0), 1.0, &FixedMeasure));
         assert!(!hit(&ellipse, PointF::new(50.0, 25.0), 1.0, &FixedMeasure));
-        let arrow = Annotation {
-            id: 2,
-            body: Body::Shape(Shape {
-                kind: ShapeKind::Arrow,
-                start: PointF::new(0.0, 0.0),
-                end: PointF::new(200.0, 0.0),
-                color: Color::BLACK,
-                width: 4.0,
-                filled: false,
-            }),
-        };
+        let arrow = Annotation { id: 2, body: Body::Shape(shape(ShapeKind::Arrow, (0.0, 0.0), (200.0, 0.0), 4.0)) };
         assert!(hit(&arrow, PointF::new(185.0, 6.0), 0.5, &FixedMeasure));
         assert!(!hit(&arrow, PointF::new(100.0, 12.0), 0.5, &FixedMeasure));
+        let mut dotted = shape(ShapeKind::Line, (0.0, 0.0), (200.0, 0.0), 4.0);
+        dotted.caps = [Cap::Dot, Cap::None];
+        let dotted = Annotation { id: 3, body: Body::Shape(dotted) };
+        assert!(hit(&dotted, PointF::new(-5.0, 5.0), 0.5, &FixedMeasure), "the start dot is part of the line");
+        assert!(dotted.bounds(&FixedMeasure).x < -5.0, "bounds include the dot");
     }
 
     #[test]
@@ -335,17 +318,7 @@ mod tests {
 
     #[test]
     fn line_handles_move_endpoints() {
-        let line = Annotation {
-            id: 1,
-            body: Body::Shape(Shape {
-                kind: ShapeKind::Arrow,
-                start: PointF::new(0.0, 0.0),
-                end: PointF::new(10.0, 0.0),
-                color: Color::BLACK,
-                width: 2.0,
-                filled: false,
-            }),
-        };
+        let line = Annotation { id: 1, body: Body::Shape(shape(ShapeKind::Arrow, (0.0, 0.0), (10.0, 0.0), 2.0)) };
         let moved = resize(&line, Handle::End, PointF::new(5.0, 5.0), &FixedMeasure);
         let Body::Shape(s) = &moved.body else { unreachable!() };
         assert_eq!((s.start, s.end), (PointF::new(0.0, 0.0), PointF::new(15.0, 5.0)));

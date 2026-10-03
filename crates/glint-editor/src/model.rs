@@ -2,6 +2,7 @@
 
 use glint_core::{PointF, RectF, RectI, SizeF, ToneMapParams};
 use glint_ui::Color;
+use serde::{Deserialize, Serialize};
 
 use crate::ink;
 use crate::math::{Vec2, outset, points_bounds};
@@ -11,6 +12,51 @@ pub enum StrokeKind {
     Pen,
     Highlighter,
 }
+
+impl StrokeKind {
+    /// The highlighter's translucency is its default group opacity.
+    pub fn default_opacity(self) -> f32 {
+        match self {
+            StrokeKind::Pen => 1.0,
+            StrokeKind::Highlighter => 0.4,
+        }
+    }
+}
+
+/// Line style. Dash lengths are multiples of the stroke width, so the pattern scales with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+impl Dash {
+    pub const ALL: [Dash; 3] = [Dash::Solid, Dash::Dashed, Dash::Dotted];
+}
+
+/// What a line or arrow ends with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Cap {
+    #[default]
+    None,
+    /// Open chevron.
+    Arrow,
+    FilledArrow,
+    Dot,
+}
+
+impl Cap {
+    pub const ALL: [Cap; 4] = [Cap::None, Cap::Arrow, Cap::FilledArrow, Cap::Dot];
+
+    pub fn is_arrow(self) -> bool {
+        matches!(self, Cap::Arrow | Cap::FilledArrow)
+    }
+}
+
+/// Default smoothing (0..=100) for new ink.
+pub const DEFAULT_SMOOTHING: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InkPoint {
@@ -29,15 +75,36 @@ impl InkPoint {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
     pub kind: StrokeKind,
+    /// Input samples (jitter filtered); smoothing is applied when drawing.
     pub points: Vec<InkPoint>,
     pub color: Color,
     /// Nominal width in image pixels.
     pub width: f32,
     /// Pen input: width follows pressure. Mouse strokes are uniform.
     pub pressure: bool,
+    /// Group opacity: overlaps within the stroke never double up.
+    pub opacity: f32,
+    pub dash: Dash,
+    /// 0..=100.
+    pub smoothing: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+impl Stroke {
+    pub fn new(kind: StrokeKind, points: Vec<InkPoint>, color: Color, width: f32) -> Self {
+        Self {
+            kind,
+            points,
+            color,
+            width,
+            pressure: false,
+            opacity: kind.default_opacity(),
+            dash: Dash::Solid,
+            smoothing: DEFAULT_SMOOTHING,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShapeKind {
     Rectangle,
     Ellipse,
@@ -51,6 +118,14 @@ impl ShapeKind {
     pub fn is_linear(self) -> bool {
         matches!(self, ShapeKind::Line | ShapeKind::Arrow)
     }
+
+    /// Start and end caps a new shape of this kind gets.
+    pub fn default_caps(self) -> [Cap; 2] {
+        match self {
+            ShapeKind::Arrow => [Cap::None, Cap::FilledArrow],
+            _ => [Cap::None, Cap::None],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,11 +137,43 @@ pub struct Shape {
     pub color: Color,
     pub width: f32,
     pub filled: bool,
+    /// Group opacity of outline, fill and heads together.
+    pub opacity: f32,
+    pub dash: Dash,
+    /// Fill alpha relative to the color.
+    pub fill_opacity: f32,
+    /// Rectangle corner radius in image pixels.
+    pub corner_radius: f32,
+    /// Start and end caps of lines and arrows.
+    pub caps: [Cap; 2],
+    /// Arrowhead size relative to the width-proportional default.
+    pub head_scale: f32,
 }
 
 impl Shape {
+    pub fn new(kind: ShapeKind, start: PointF, end: PointF, color: Color, width: f32) -> Self {
+        Self {
+            kind,
+            start,
+            end,
+            color,
+            width,
+            filled: false,
+            opacity: 1.0,
+            dash: Dash::Solid,
+            fill_opacity: 1.0,
+            corner_radius: 0.0,
+            caps: kind.default_caps(),
+            head_scale: 1.0,
+        }
+    }
+
     pub fn rect(&self) -> RectF {
         RectF::from_points(self.start, self.end)
+    }
+
+    pub fn line_geometry(&self) -> ink::LineGeometry {
+        ink::line_geometry(self.start, self.end, self.width, self.caps, self.head_scale)
     }
 }
 
@@ -89,7 +196,7 @@ impl TextNote {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RedactKind {
     Blur,
     Pixelate,
@@ -130,11 +237,9 @@ impl Annotation {
                 outset(r, reach * 0.5)
             }
             Body::Shape(s) => match s.kind {
-                ShapeKind::Line => outset(s.rect(), s.width * 0.5),
-                ShapeKind::Arrow => {
-                    let head = ink::arrow(s.start, s.end, s.width);
-                    let pts = head.head.iter().copied().chain([s.start, s.end]);
-                    outset(points_bounds(pts).unwrap_or_default(), s.width * 0.5)
+                ShapeKind::Line | ShapeKind::Arrow => {
+                    let points = s.line_geometry().points().into_iter().chain([s.start, s.end]);
+                    outset(points_bounds(points).unwrap_or_default(), s.width * 0.5)
                 }
                 ShapeKind::Rectangle | ShapeKind::Ellipse => {
                     if s.filled { s.rect() } else { outset(s.rect(), s.width * 0.5) }
@@ -266,16 +371,8 @@ pub(crate) mod tests {
 
     #[test]
     fn translate_moves_every_kind() {
-        let mut a = Annotation {
-            id: 1,
-            body: Body::Stroke(Stroke {
-                kind: StrokeKind::Pen,
-                points: vec![InkPoint::new(0.0, 0.0, 0.5), InkPoint::new(10.0, 0.0, 0.5)],
-                color: Color::BLACK,
-                width: 2.0,
-                pressure: false,
-            }),
-        };
+        let points = vec![InkPoint::new(0.0, 0.0, 0.5), InkPoint::new(10.0, 0.0, 0.5)];
+        let mut a = Annotation { id: 1, body: Body::Stroke(Stroke::new(StrokeKind::Pen, points, Color::BLACK, 2.0)) };
         a.translate(PointF::new(5.0, 5.0));
         assert_eq!(a.bounds(&FixedMeasure), RectF::new(4.0, 4.0, 12.0, 2.0));
     }

@@ -329,6 +329,7 @@ impl EditorView {
             self.copy_unsynced(cx);
         }
         tools::remember(self.tool, &self.options);
+        tools::persist();
         self.retoner = None;
         self.ocr_job += 1;
         if cx.hwnd() != 0 {

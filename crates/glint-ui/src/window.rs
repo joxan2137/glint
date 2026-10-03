@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGISurface, IDXGISwapChain2,
 };
-use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetSystemMetricsForDpi};
@@ -1228,8 +1228,14 @@ fn handle_message(app: &App, win: &Rc<WindowState>, msg: u32, wparam: WPARAM, lp
         WM_POINTERACTIVATE if !win.spec.activates() => Some(LRESULT(PA_NOACTIVATE as isize)),
         WM_ACTIVATE => None,
         WM_PAINT => {
-            // SAFETY: validating our own window's update region.
-            let _ = unsafe { ValidateRect(Some(hwnd), None) };
+            // BeginPaint/EndPaint clear both the update region and the internal-paint flag; ValidateRect alone
+            // left hidden layered popups receiving WM_PAINT forever. Content itself comes from DirectComposition.
+            let mut paint = PAINTSTRUCT::default();
+            // SAFETY: paired calls on our own window inside its WM_PAINT handler.
+            unsafe {
+                BeginPaint(hwnd, &mut paint);
+                let _ = EndPaint(hwnd, &paint);
+            }
             app.request_frame(win);
             Some(LRESULT(0))
         }

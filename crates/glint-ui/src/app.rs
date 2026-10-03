@@ -528,12 +528,17 @@ impl App {
         Ok(())
     }
 
+    /// Drains the message queue, but never more than `MAX_MESSAGES_PER_TURN` so a message storm cannot starve
+    /// timers, app events and rendering.
     fn pump_messages(&self) -> bool {
+        const MAX_MESSAGES_PER_TURN: u32 = 256;
         let wake = HWND(self.0.wake_hwnd.get() as *mut _);
         let mut msg = MSG::default();
+        let mut handled = 0;
         // SAFETY: standard message pump on this thread.
         unsafe {
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            while handled < MAX_MESSAGES_PER_TURN && PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                handled += 1;
                 if msg.message == WM_QUIT {
                     self.0.quit.set(true);
                     return false;

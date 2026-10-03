@@ -1,0 +1,102 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["joxan2137"]
+
+[workspace.dependencies]
+glint-core = { path = "crates/glint-core" }
+glint-capture = { path = "crates/glint-capture" }
+glint-ui = { path = "crates/glint-ui" }
+glint-sys = { path = "crates/glint-sys" }
+glint-record = { path = "crates/glint-record" }
+glint-overlay = { path = "crates/glint-overlay" }
+glint-editor = { path = "crates/glint-editor" }
+
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+log = "0.4.34"
+half = { version = "2.7.1", features = ["bytemuck"] }
+bytemuck = { version = "1.25.2", features = ["derive"] }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+png = "0.18.1"
+icondata_lu = "0.1.0"
+icondata_core = "0.1.0"
+embed-resource = "3.0.11"
+windows-core = "0.62"
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "UI_ViewManagement",
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Imaging_D2D",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+debug = "line-tables-only"

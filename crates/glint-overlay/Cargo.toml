@@ -1,0 +1,15 @@
+[package]
+name = "glint-overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glint-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+windows.workspace = true
+windows-core.workspace = true
+glint-ui.workspace = true
+glint-capture.workspace = true
+glint-sys.workspace = true

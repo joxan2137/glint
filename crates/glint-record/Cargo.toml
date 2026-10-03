@@ -1,0 +1,15 @@
+[package]
+name = "glint-record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glint-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+windows = { workspace = true, features = ["Win32_System_Performance", "Security_Authorization_AppCapabilityAccess"] }
+windows-core.workspace = true
+
+[dev-dependencies]
+png.workspace = true

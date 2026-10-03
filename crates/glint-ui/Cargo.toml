@@ -1,0 +1,21 @@
+[package]
+name = "glint-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glint-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+windows-core.workspace = true
+windows-numerics = "0.3.1"
+icondata_lu.workspace = true
+icondata_core.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = ["Win32_System_Performance"]
+
+[dev-dependencies]
+png.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "glint-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "glint_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glint"
+path = "src/main.rs"
+
+[dependencies]
+glint-core.workspace = true
+glint-capture.workspace = true
+glint-ui.workspace = true
+glint-sys.workspace = true
+glint-record.workspace = true
+glint-overlay.workspace = true
+glint-editor.workspace = true
+anyhow.workspace = true
+log.workspace = true
+serde_json.workspace = true
+windows = { workspace = true, features = ["Win32_System_Console", "Win32_System_RemoteDesktop"] }
+windows-core.workspace = true
+
+[build-dependencies]
+embed-resource.workspace = true

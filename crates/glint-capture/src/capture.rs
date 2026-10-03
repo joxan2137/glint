@@ -4,33 +4,39 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Error, Result, anyhow, bail};
 use glint_core::settings::HdrSettings;
-use glint_core::tonemap::{ToneMapParams, analyze, tonemap_with_stats};
-use glint_core::{HdrImage, MonitorCapture, MonitorInfo};
+use glint_core::{Image, MonitorCapture, MonitorInfo};
+use windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL;
 
 use crate::duplication;
 use crate::dxgi::{self, DxgiOutput};
 use crate::gdi;
-use crate::gpu::{DesktopFrame, Fp16Frame, Gpu};
+use crate::gpu::Gpu;
 use crate::graphics_capture;
 use crate::monitors::monitors;
-
-const DEFAULT_SDR_WHITE_NITS: f32 = 80.0;
-const DEFAULT_DISPLAY_PEAK_NITS: f32 = 1000.0;
+use crate::pipeline::{Grabbed, StageTimings};
+use crate::threads;
 
 /// How a monitor image is grabbed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMethod {
     /// DXGI desktop duplication; waits up to 30 ms for a frame, so a static desktop yields nothing.
     Dda,
-    /// Windows.Graphics.Capture, one frame; works on a static desktop.
+    /// Windows.Graphics.Capture, one frame; works on a static desktop and keeps HDR intact.
     Wgc,
-    /// GDI BitBlt; SDR only.
+    /// GDI BitBlt; SDR only, fast.
     Gdi,
 }
 
 impl CaptureMethod {
-    /// The order every normal capture tries.
-    pub const DEFAULT_ORDER: [CaptureMethod; 3] = [CaptureMethod::Dda, CaptureMethod::Wgc, CaptureMethod::Gdi];
+    /// The order a normal capture tries: SDR monitors fall back to GDI (exact for SDR, fastest), HDR monitors to
+    /// Windows.Graphics.Capture (GDI would clip the highlights) and only then to GDI.
+    pub fn default_order(monitor: &MonitorInfo) -> &'static [CaptureMethod] {
+        if monitor.hdr.is_some() {
+            &[CaptureMethod::Dda, CaptureMethod::Wgc, CaptureMethod::Gdi]
+        } else {
+            &[CaptureMethod::Dda, CaptureMethod::Gdi]
+        }
+    }
 }
 
 impl fmt::Display for CaptureMethod {
@@ -82,29 +88,56 @@ pub struct CaptureReport {
     pub path: CapturePath,
     /// Why the methods tried before `path` were abandoned, e.g. "DDA: no frame with a desktop image within 30 ms".
     pub fallback_reason: Option<String>,
-    /// Device setup, capture, frame acquire and CPU readback (or the GDI blit).
+    /// Everything except the tone map.
     pub grab: Duration,
-    /// Stats plus tone mapping; zero for SDR frames.
+    /// Statistics, curve and tone map orchestration; zero for SDR frames.
     pub tonemap: Duration,
     pub total: Duration,
+    pub stages: StageTimings,
 }
 
-/// Captures every monitor in parallel (one thread each), in `monitors()` order.
+/// Called on a capture thread with (monitor index in `monitors()` order, monitor, image) as soon as a monitor's
+/// tone-mapped image exists, before its raw HDR data has finished copying.
+pub type SdrReady<'a> = &'a (dyn Fn(usize, &MonitorInfo, &Image) + Sync);
+
+/// Captures every monitor in parallel (one thread each, slightly above normal priority), in `monitors()` order.
 /// Monitors that fail on every method are logged and skipped; all failing is an error.
 pub fn capture_all(hdr: &HdrSettings) -> Result<Vec<MonitorCapture>> {
     Ok(capture_all_reported(hdr)?.into_iter().map(|(capture, _)| capture).collect())
 }
 
 pub fn capture_all_reported(hdr: &HdrSettings) -> Result<Vec<(MonitorCapture, CaptureReport)>> {
-    capture_all_via(hdr, &CaptureMethod::DEFAULT_ORDER)
+    capture_all_streaming(hdr, &|_, _, _| {})
 }
 
-/// Like `capture_all_reported` with an explicit method order, e.g. `[Wgc, Gdi]` to simulate a static desktop.
+/// Like `capture_all_reported`, but `on_sdr` fires per monitor as soon as its `sdr` image is ready.
+pub fn capture_all_streaming(hdr: &HdrSettings, on_sdr: SdrReady) -> Result<Vec<(MonitorCapture, CaptureReport)>> {
+    capture_all_impl(hdr, None, on_sdr)
+}
+
+/// Like `capture_all_reported` with one explicit method order for every monitor, e.g. `[Wgc, Gdi]`.
 pub fn capture_all_via(hdr: &HdrSettings, order: &[CaptureMethod]) -> Result<Vec<(MonitorCapture, CaptureReport)>> {
+    capture_all_impl(hdr, Some(order), &|_, _, _| {})
+}
+
+fn capture_all_impl(
+    hdr: &HdrSettings,
+    order: Option<&[CaptureMethod]>,
+    on_sdr: SdrReady,
+) -> Result<Vec<(MonitorCapture, CaptureReport)>> {
     let monitors = monitors()?;
     let results: Vec<Result<(MonitorCapture, CaptureReport)>> = std::thread::scope(|scope| {
-        let workers: Vec<_> =
-            monitors.iter().map(|monitor| scope.spawn(move || capture_monitor_via(monitor, hdr, order))).collect();
+        let workers: Vec<_> = monitors
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| {
+                scope.spawn(move || {
+                    threads::set_current_priority(THREAD_PRIORITY_ABOVE_NORMAL);
+                    let order = order.unwrap_or_else(|| CaptureMethod::default_order(monitor));
+                    capture_monitor_impl(monitor, hdr, order, &|image| on_sdr(index, monitor, image))
+                })
+            })
+            .collect();
         workers
             .into_iter()
             .map(|worker| worker.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked"))))
@@ -127,9 +160,9 @@ pub fn capture_monitor(monitor: &MonitorInfo, hdr: &HdrSettings) -> Result<Monit
     Ok(capture_monitor_reported(monitor, hdr)?.0)
 }
 
-/// Desktop duplication, then Windows.Graphics.Capture, then GDI BitBlt. FP16 frames are tone mapped.
+/// `CaptureMethod::default_order` for this monitor. FP16 frames are tone mapped on the GPU.
 pub fn capture_monitor_reported(monitor: &MonitorInfo, hdr: &HdrSettings) -> Result<(MonitorCapture, CaptureReport)> {
-    capture_monitor_via(monitor, hdr, &CaptureMethod::DEFAULT_ORDER)
+    capture_monitor_via(monitor, hdr, CaptureMethod::default_order(monitor))
 }
 
 /// Forces Windows.Graphics.Capture; mainly useful to cross-check the other methods.
@@ -142,28 +175,40 @@ pub fn capture_monitor_gdi(monitor: &MonitorInfo) -> Result<MonitorCapture> {
     Ok(capture_monitor_via(monitor, &HdrSettings::default(), &[CaptureMethod::Gdi])?.0)
 }
 
-/// Tries `order` until one method yields a frame. All GPU objects are released before the tone map runs.
+/// Tries `order` until one method yields a frame. All GPU objects are released before the CPU copies finish.
 pub fn capture_monitor_via(
     monitor: &MonitorInfo,
     hdr: &HdrSettings,
     order: &[CaptureMethod],
 ) -> Result<(MonitorCapture, CaptureReport)> {
+    capture_monitor_impl(monitor, hdr, order, &|_| {})
+}
+
+fn capture_monitor_impl(
+    monitor: &MonitorInfo,
+    hdr: &HdrSettings,
+    order: &[CaptureMethod],
+    on_sdr: &dyn Fn(&Image),
+) -> Result<(MonitorCapture, CaptureReport)> {
     let started = Instant::now();
+    let mut clock = StageTimings::default();
     let mut abandoned = Vec::new();
     let mut gpu: Option<Result<(DxgiOutput, Gpu)>> = None;
     for &method in order {
         let attempt = match method {
-            CaptureMethod::Gdi => gdi::grab(monitor.rect).map(DesktopFrame::Bgra),
+            CaptureMethod::Gdi => grab_gdi(monitor, on_sdr, &mut clock),
             CaptureMethod::Dda | CaptureMethod::Wgc => match gpu.get_or_insert_with(|| open_gpu(monitor)) {
-                Ok((target, gpu)) if method == CaptureMethod::Dda => duplication::grab(monitor, &target.output, gpu),
-                Ok((_, gpu)) => graphics_capture::grab(monitor, gpu),
+                Ok((target, gpu)) if method == CaptureMethod::Dda => {
+                    duplication::grab(monitor, &target.output, gpu, hdr, on_sdr, &mut clock)
+                }
+                Ok((_, gpu)) => graphics_capture::grab(monitor, gpu, hdr, on_sdr, &mut clock),
                 Err(error) => Err(anyhow!("GPU setup: {error:#}")),
             },
         };
         match attempt {
-            Ok(frame) => {
+            Ok(grabbed) => {
                 drop(gpu);
-                return Ok(finish(monitor, hdr, frame, method, started, abandoned));
+                return Ok(report(monitor, grabbed, method, started, clock, abandoned));
             }
             Err(error) => {
                 log::info!("{}: {method} yielded no frame ({error:#})", monitor.device_name);
@@ -181,56 +226,77 @@ fn open_gpu(monitor: &MonitorInfo) -> Result<(DxgiOutput, Gpu)> {
     Ok((target, gpu))
 }
 
-fn finish(
-    monitor: &MonitorInfo,
-    hdr: &HdrSettings,
-    frame: DesktopFrame,
-    method: CaptureMethod,
-    started: Instant,
-    abandoned: Vec<String>,
-) -> (MonitorCapture, CaptureReport) {
-    let grab = started.elapsed();
-    let (path, capture, tonemap) = match (frame, method) {
-        (DesktopFrame::Bgra(sdr), method) => (
-            match method {
-                CaptureMethod::Dda => CapturePath::DdaBgra,
-                CaptureMethod::Wgc => CapturePath::WgcBgra,
-                CaptureMethod::Gdi => CapturePath::Gdi,
-            },
-            MonitorCapture { monitor: monitor.clone(), sdr, hdr: None, hdr_stats: None },
-            Duration::ZERO,
-        ),
-        (DesktopFrame::Fp16(frame), method) => {
-            let tonemap_started = Instant::now();
-            let image = hdr_image(monitor, frame);
-            let params = ToneMapParams { mode: hdr.mode, exposure_stops: hdr.exposure_stops };
-            let stats = analyze(&image);
-            let sdr = tonemap_with_stats(&image, &params, &stats);
-            let capture =
-                MonitorCapture { monitor: monitor.clone(), sdr, hdr: Some(image), hdr_stats: Some(stats) };
-            let path = if method == CaptureMethod::Dda { CapturePath::DdaFp16 } else { CapturePath::WgcFp16 };
-            (path, capture, tonemap_started.elapsed())
-        }
-    };
-    let total = started.elapsed();
-    log::info!("{}: captured via {path} in {total:?} (grab {grab:?}, tone map {tonemap:?})", monitor.device_name);
-    let fallback_reason = (!abandoned.is_empty()).then(|| abandoned.join("; "));
-    (capture, CaptureReport { path, fallback_reason, grab, tonemap, total })
+fn grab_gdi(monitor: &MonitorInfo, on_sdr: &dyn Fn(&Image), clock: &mut StageTimings) -> Result<Grabbed> {
+    let started = Instant::now();
+    let sdr = gdi::grab(monitor.rect)?;
+    clock.copy_map += started.elapsed();
+    on_sdr(&sdr);
+    Ok(Grabbed { sdr, hdr: None, stats: None })
 }
 
-fn hdr_image(monitor: &MonitorInfo, frame: Fp16Frame) -> HdrImage {
-    let sdr_white_nits = monitor.hdr.map_or(DEFAULT_SDR_WHITE_NITS, |hdr| hdr.sdr_white_nits);
-    let display_peak_nits = monitor
-        .hdr
-        .map(|hdr| hdr.max_nits)
-        .filter(|nits| *nits > 0.0)
-        .unwrap_or(DEFAULT_DISPLAY_PEAK_NITS);
-    HdrImage { width: frame.width, height: frame.height, data: frame.data, sdr_white_nits, display_peak_nits }
+fn report(
+    monitor: &MonitorInfo,
+    grabbed: Grabbed,
+    method: CaptureMethod,
+    started: Instant,
+    stages: StageTimings,
+    abandoned: Vec<String>,
+) -> (MonitorCapture, CaptureReport) {
+    let path = match (method, grabbed.hdr.is_some()) {
+        (CaptureMethod::Dda, true) => CapturePath::DdaFp16,
+        (CaptureMethod::Dda, false) => CapturePath::DdaBgra,
+        (CaptureMethod::Wgc, true) => CapturePath::WgcFp16,
+        (CaptureMethod::Wgc, false) => CapturePath::WgcBgra,
+        (CaptureMethod::Gdi, _) => CapturePath::Gdi,
+    };
+    let total = started.elapsed();
+    let capture = MonitorCapture {
+        monitor: monitor.clone(),
+        sdr: grabbed.sdr,
+        hdr: grabbed.hdr,
+        hdr_stats: grabbed.stats,
+    };
+    let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+    log::info!(
+        "{}: {path} {:.1} ms (setup {:.1}, acquire {:.1}, copy+map {:.1}, convert {:.1}, tone map {:.1})",
+        monitor.device_name,
+        ms(total),
+        ms(stages.setup),
+        ms(stages.acquire),
+        ms(stages.copy_map),
+        ms(stages.convert),
+        ms(stages.tonemap)
+    );
+    let fallback_reason = (!abandoned.is_empty()).then(|| abandoned.join("; "));
+    let report = CaptureReport {
+        path,
+        fallback_reason,
+        grab: total.saturating_sub(stages.tonemap),
+        tonemap: stages.tonemap,
+        total,
+        stages,
+    };
+    (capture, report)
 }
 
 #[cfg(test)]
 mod tests {
+    use glint_core::{HdrInfo, RectI};
+
     use super::*;
+
+    fn monitor(hdr: bool) -> MonitorInfo {
+        MonitorInfo {
+            handle: 0,
+            device_name: "test".into(),
+            friendly_name: "test".into(),
+            rect: RectI::new(0, 0, 100, 100),
+            work_rect: RectI::new(0, 0, 100, 100),
+            dpi: 96,
+            primary: true,
+            hdr: hdr.then_some(HdrInfo { sdr_white_nits: 200.0, max_nits: 1000.0, max_full_frame_nits: 600.0, min_nits: 0.0 }),
+        }
+    }
 
     #[test]
     fn methods_parse_case_insensitively() {
@@ -240,7 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn default_order_is_dda_wgc_gdi() {
-        assert_eq!(CaptureMethod::DEFAULT_ORDER, [CaptureMethod::Dda, CaptureMethod::Wgc, CaptureMethod::Gdi]);
+    fn sdr_monitors_skip_wgc_and_hdr_monitors_keep_it() {
+        assert_eq!(CaptureMethod::default_order(&monitor(false)), [CaptureMethod::Dda, CaptureMethod::Gdi]);
+        assert_eq!(
+            CaptureMethod::default_order(&monitor(true)),
+            [CaptureMethod::Dda, CaptureMethod::Wgc, CaptureMethod::Gdi]
+        );
     }
 }

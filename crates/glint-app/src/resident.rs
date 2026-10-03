@@ -7,14 +7,14 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use glint_core::encode;
 use glint_core::settings::HdrSettings;
 use glint_core::{CaptureMode, HdrImage, Image, ImageFormat, MonitorCapture, MonitorInfo, Settings, ToneMapParams, WindowInfo};
 use glint_editor::{EditorDoc, EditorHost};
-use glint_overlay::{OverlayOutcome, OverlayPrefs, OverlayRequest, RecordRegion, Snip};
+use glint_overlay::{OverlayOutcome, OverlayPool, OverlayPrefs, OverlayRequest, OverlaySession, RecordRegion, Snip};
 use glint_record::{RecordConfig, Recorder, RecorderStatus, RecordingInfo};
 use glint_sys::hotkey::{HookConfig, HotkeyAction, KeyboardHook};
 use glint_sys::{clipboard, dialogs, install, paths, settings_store, shell, sound};
@@ -32,7 +32,10 @@ use crate::settings_model::{
     DisplayLine, FolderKind, InstallState, SettingsEnv, SettingsRequest, effects,
 };
 use crate::settings_view::{MIN_SIZE, SettingsMessage, SettingsView, WINDOW_SIZE};
-use crate::system::{cursor_pos, hide_instantly, hwnd, join_bounded, monitor_at, show_again};
+use crate::system::{
+    cursor_pos, display_rects, hide_instantly, hwnd, join_bounded, monitor_at, raise_ui_priority, raise_worker_priority,
+    show_again,
+};
 use crate::thumbnail::{ThumbnailAction, ThumbnailContent, ThumbnailEvent, ThumbnailView, card_size};
 use crate::toast::{Tint, Toast, ToastClosed, ToastIcon, ToastView};
 use crate::tray::{TrayCommand, TrayIcon, command_for, menu_items};
@@ -45,6 +48,8 @@ const TRAY_ATTEMPTS: u32 = 60;
 /// Time for DWM to take hidden editor windows off the screen before capturing.
 const EDITOR_HIDE_SETTLE: Duration = Duration::from_millis(120);
 const QUIT_WORKER_WAIT: Duration = Duration::from_secs(5);
+/// Display changes arrive in bursts; the monitor cache and overlay pool are rebuilt once things settle.
+const DISPLAY_SETTLE: Duration = Duration::from_millis(400);
 const END_SESSION_WORKER_WAIT: Duration = Duration::from_secs(3);
 
 /// What a capture is for.
@@ -58,7 +63,6 @@ pub enum Intent {
 /// Frozen screen state from a worker thread.
 pub struct Frozen {
     captures: Vec<MonitorCapture>,
-    windows: Vec<WindowInfo>,
     foreground: Option<WindowInfo>,
 }
 
@@ -70,8 +74,12 @@ pub enum CountdownPurpose {
 /// Everything posted to the UI thread's main handler.
 pub enum AppEvent {
     Host(HostMessage),
-    Hotkey(HotkeyAction),
-    Captured { intent: Intent, result: Result<Frozen> },
+    /// A shortcut and when the hook saw it.
+    Hotkey(HotkeyAction, Instant),
+    /// `generation` ties overlay captures to the overlay session they were started for.
+    Captured { intent: Intent, generation: u64, result: Result<Frozen> },
+    /// One monitor's final image, ahead of the complete captures.
+    MonitorFrozen { generation: u64, monitor: MonitorInfo, sdr: Image },
     OverlayClosed { outcome: OverlayOutcome, prefs: OverlayPrefs },
     CountdownDone { purpose: CountdownPurpose, completed: bool },
     PipelineDone { errors: Vec<String> },
@@ -144,6 +152,16 @@ struct State {
     hidden_editors: Vec<isize>,
     /// Workers whose result must not be lost at exit (files, clipboard, recording finalize).
     workers: Vec<JoinHandle<()>>,
+    /// Monitors as of the last display change, so the hotkey path never waits on DXGI or display-config queries.
+    monitors: Vec<MonitorInfo>,
+    /// Hidden overlay windows ready to show on the next hotkey.
+    overlay_pool: Option<OverlayPool>,
+    /// The layout changed while an overlay was open: rebuild the pool once it closes.
+    pool_stale: bool,
+    display_timer: Option<TimerId>,
+    capture_generation: u64,
+    /// The open overlay and the capture generation feeding it.
+    overlay: Option<(u64, OverlaySession)>,
 }
 
 /// What `main` does after the loop ends.
@@ -165,6 +183,7 @@ pub fn run(initial: Command) -> Result<Exit> {
     let settings = settings_store::load_settings();
     let relaunch: Rc<RefCell<Option<PathBuf>>> = Rc::default();
     let relaunch_out = relaunch.clone();
+    raise_ui_priority();
     glint_ui::run(move |app: &App| {
         app.set_quit_when_no_windows(false);
         app.set_appearance(settings.appearance.theme, settings.appearance.system_accent);
@@ -193,11 +212,19 @@ pub fn run(initial: Command) -> Result<Exit> {
                 editors: Vec::new(),
                 hidden_editors: Vec::new(),
                 workers: Vec::new(),
+                monitors: Vec::new(),
+                overlay_pool: None,
+                pool_stale: false,
+                display_timer: None,
+                capture_generation: 0,
+                overlay: None,
             })),
             proxy,
         };
         glint.register(app, relaunch.clone());
         let hook_ok = glint.start_hook();
+        let ready = glint.clone();
+        app.set_timer(Duration::ZERO, move |app| ready.refresh_monitors(app));
         glint.show_tray_with_retry(app, TRAY_ATTEMPTS);
         warm_up_capture();
         cleanup_drag_files();
@@ -338,7 +365,7 @@ impl Glint {
         let config = HookConfig::from(&self.state.borrow().settings.hotkeys);
         let proxy = self.proxy.clone();
         match KeyboardHook::start(config, move |action| {
-            proxy.post(AppEvent::Hotkey(action));
+            proxy.post(AppEvent::Hotkey(action, Instant::now()));
         }) {
             Ok(hook) => {
                 self.state.borrow_mut().hook = Some(hook);
@@ -386,9 +413,9 @@ impl Glint {
             }
             Command::Snip(mode) => {
                 let mode = mode.unwrap_or_else(|| snip_mode(&self.state.borrow().settings));
-                self.capture(app, Intent::Overlay { mode, video: false });
+                self.capture(app, Intent::Overlay { mode, video: false }, Instant::now());
             }
-            Command::Record => self.record_shortcut(app),
+            Command::Record => self.record_shortcut(app, Instant::now()),
             Command::Settings => self.open_settings(app),
             Command::Edit(path) => self.open_image(app, path),
             Command::Quit => self.quit(),
@@ -400,8 +427,13 @@ impl Glint {
     fn on_event(&self, app: &App, event: AppEvent) {
         match event {
             AppEvent::Host(message) => self.on_host(app, message),
-            AppEvent::Hotkey(action) => self.on_hotkey(app, action),
-            AppEvent::Captured { intent, result } => self.on_captured(app, intent, result),
+            AppEvent::Hotkey(action, at) => self.on_hotkey(app, action, at),
+            AppEvent::Captured { intent, generation, result } => self.on_captured(app, intent, generation, result),
+            AppEvent::MonitorFrozen { generation, monitor, sdr } => {
+                if let Some(session) = self.overlay_session(generation) {
+                    session.show_frozen(app, &monitor, sdr);
+                }
+            }
             AppEvent::OverlayClosed { outcome, prefs } => self.on_overlay_closed(app, outcome, prefs),
             AppEvent::CountdownDone { purpose, completed } => self.on_countdown(app, purpose, completed),
             AppEvent::PipelineDone { errors } => {
@@ -451,7 +483,7 @@ impl Glint {
             }
             HostMessage::TrayActivate => {
                 let mode = snip_mode(&self.state.borrow().settings);
-                self.capture(app, Intent::Overlay { mode, video: false });
+                self.capture(app, Intent::Overlay { mode, video: false }, Instant::now());
             }
             HostMessage::TrayMenu(at) => self.tray_menu(app, at),
             HostMessage::TaskbarCreated => {
@@ -466,6 +498,7 @@ impl Glint {
             HostMessage::DisplayChanged => {
                 self.refresh_tray(app);
                 warm_up_capture();
+                self.schedule_monitor_refresh(app);
             }
         }
     }
@@ -495,12 +528,12 @@ impl Glint {
         };
         match command {
             TrayCommand::Snip(mode) => {
-                self.capture(app, Intent::Overlay { mode, video: false });
+                self.capture(app, Intent::Overlay { mode, video: false }, Instant::now());
             }
-            TrayCommand::Record => self.record_shortcut(app),
+            TrayCommand::Record => self.record_shortcut(app, Instant::now()),
             TrayCommand::StopRecording => self.stop_recording(app),
             TrayCommand::Text => {
-                self.capture(app, Intent::Overlay { mode: CaptureMode::Text, video: false });
+                self.capture(app, Intent::Overlay { mode: CaptureMode::Text, video: false }, Instant::now());
             }
             TrayCommand::OpenImage => {
                 let folder = paths::screenshots_dir(&self.settings()).ok();
@@ -519,55 +552,64 @@ impl Glint {
         }
     }
 
-    fn on_hotkey(&self, app: &App, action: HotkeyAction) {
-        log::info!("hotkey {action:?}");
+    fn on_hotkey(&self, app: &App, action: HotkeyAction, at: Instant) {
+        log::info!("hotkey {action:?} (reached the UI thread after {:.1} ms)", at.elapsed().as_secs_f64() * 1000.0);
         let mode = snip_mode(&self.state.borrow().settings);
         match action {
             HotkeyAction::Snip => {
-                self.capture(app, Intent::Overlay { mode, video: false });
+                self.capture(app, Intent::Overlay { mode, video: false }, at);
             }
             HotkeyAction::Text => {
-                self.capture(app, Intent::Overlay { mode: CaptureMode::Text, video: false });
+                self.capture(app, Intent::Overlay { mode: CaptureMode::Text, video: false }, at);
             }
-            HotkeyAction::Record => self.record_shortcut(app),
+            HotkeyAction::Record => self.record_shortcut(app, at),
             HotkeyAction::WindowToClipboard => {
-                self.capture(app, Intent::ActiveWindow);
+                self.capture(app, Intent::ActiveWindow, at);
             }
         }
     }
 
-    fn record_shortcut(&self, app: &App) {
+    fn record_shortcut(&self, app: &App, at: Instant) {
         if self.state.borrow().recording.is_some() {
             self.stop_recording(app);
         } else {
             let mode = snip_mode(&self.state.borrow().settings);
-            self.capture(app, Intent::Overlay { mode, video: true });
+            self.capture(app, Intent::Overlay { mode, video: true }, at);
         }
     }
 
     // ---- capture ------------------------------------------------------------------------------------------------
 
-    /// Freezes every monitor on a worker thread, then opens the overlay (or finishes Alt+Print Screen). Returns
-    /// false when it did not start. While recording, the overlay opens for photos only.
-    fn capture(&self, app: &App, intent: Intent) -> bool {
-        let (hdr, intent) = {
+    /// Freezes every monitor on a worker thread. For the overlay it opens at once over the live desktop (its
+    /// windows are excluded from capture) and gets the frozen pixels when they arrive; Alt+Print Screen finishes
+    /// when the capture is done. Returns false when it did not start. While recording, the overlay opens for photos
+    /// only.
+    fn capture(&self, app: &App, intent: Intent, requested_at: Instant) -> bool {
+        let (hdr, intent, generation) = {
             let mut state = self.state.borrow_mut();
             if state.busy != Busy::Idle {
                 log::info!("capture ignored: {:?} in progress", state.busy);
                 return false;
             }
-            state.busy = Busy::Capturing;
+            state.busy = if matches!(intent, Intent::Overlay { .. }) { Busy::Overlay } else { Busy::Capturing };
+            state.capture_generation += 1;
             let intent = match intent {
                 Intent::Overlay { mode, video: true } if state.recording.is_some() => Intent::Overlay { mode, video: false },
                 other => other,
             };
-            (state.settings.hdr.clone(), intent)
+            (state.settings.hdr.clone(), intent, state.capture_generation)
         };
         let proxy = self.proxy.clone();
         let started = spawn_worker("glint-capture", move || {
-            let result = std::panic::catch_unwind(|| freeze(&hdr, intent))
+            raise_worker_priority();
+            let early = |_: usize, monitor: &MonitorInfo, sdr: &Image| {
+                if matches!(intent, Intent::Overlay { .. }) {
+                    proxy.post(AppEvent::MonitorFrozen { generation, monitor: monitor.clone(), sdr: sdr.clone() });
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| freeze(&hdr, intent, &early)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the capture thread panicked")));
-            proxy.post(AppEvent::Captured { intent, result });
+            proxy.post(AppEvent::Captured { intent, generation, result });
         });
         if started.is_none() {
             self.state.borrow_mut().busy = Busy::Idle;
@@ -575,7 +617,135 @@ impl Glint {
             self.toast(app, Toast::new(ToastIcon::Symbol(glint_ui::Icon::Info, Tint::Destructive), "Couldn't capture the screen", detail));
             return false;
         }
+        if let Intent::Overlay { mode, video } = intent {
+            return self.open_live_overlay(app, mode, video, generation, requested_at);
+        }
         true
+    }
+
+    /// Opens the overlay over the live desktop: cached monitors, a synchronous window snapshot (hover highlights),
+    /// pooled windows when they fit. The capture already runs on a worker.
+    fn open_live_overlay(&self, app: &App, mode: CaptureMode, video: bool, generation: u64, requested_at: Instant) -> bool {
+        let snapshot_started = Instant::now();
+        let windows = glint_capture::windows_snapshot(Some(std::process::id()));
+        let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+        let monitors = self.current_monitors();
+        let settings = self.settings();
+        let request = OverlayRequest {
+            monitors,
+            captures: Vec::new(),
+            windows,
+            mode,
+            video,
+            show_magnifier: settings.capture.show_magnifier,
+            delay_secs: settings.capture.delay_secs,
+            hdr: settings.hdr.clone(),
+            system_audio: settings.record.system_audio,
+            microphone: settings.record.microphone,
+            requested_at: Some(requested_at),
+        };
+        let done = |app: &App, outcome, prefs| app.post(AppEvent::OverlayClosed { outcome, prefs });
+        let pool = self.state.borrow_mut().overlay_pool.take();
+        let opened = match &pool {
+            Some(pool) => pool.open(app, request, done),
+            None => glint_overlay::open_overlay(app, request, done),
+        };
+        self.state.borrow_mut().overlay_pool = pool;
+        log::info!(
+            "overlay requested {:.1} ms after the shortcut (window snapshot {snapshot_ms:.1} ms)",
+            requested_at.elapsed().as_secs_f64() * 1000.0
+        );
+        match opened {
+            Ok(session) => {
+                self.state.borrow_mut().overlay = Some((generation, session));
+                true
+            }
+            Err(error) => {
+                self.state.borrow_mut().busy = Busy::Idle;
+                self.restore_editors(true);
+                self.error_toast(app, "Couldn't open the snip overlay", &error);
+                false
+            }
+        }
+    }
+
+    /// The cached monitors, re-queried only when the layout no longer matches (cheap check: `EnumDisplayMonitors`
+    /// rects and per-monitor DPI).
+    fn current_monitors(&self) -> Vec<MonitorInfo> {
+        let cached = self.state.borrow().monitors.clone();
+        let mut live = display_rects();
+        let mut known: Vec<RectI> = cached.iter().map(|m| m.rect).collect();
+        live.sort_by_key(|r| (r.x, r.y));
+        known.sort_by_key(|r| (r.x, r.y));
+        let current = !cached.is_empty() && live == known && cached.iter().all(|m| glint_ui::win::dpi_for_rect(m.rect) == m.dpi);
+        if current {
+            return cached;
+        }
+        log::info!("display layout changed since the monitor cache was built; refreshing");
+        match glint_capture::monitors() {
+            Ok(monitors) => {
+                let mut state = self.state.borrow_mut();
+                state.monitors = monitors.clone();
+                state.pool_stale = true;
+                monitors
+            }
+            Err(error) => {
+                log::warn!("monitors: {error:#}");
+                cached
+            }
+        }
+    }
+
+    // ---- monitor cache and overlay pool ----------------------------------------------------------------------
+
+    fn schedule_monitor_refresh(&self, app: &App) {
+        if let Some(timer) = self.state.borrow_mut().display_timer.take() {
+            app.cancel_timer(timer);
+        }
+        let glint = self.clone();
+        let timer = app.set_timer(DISPLAY_SETTLE, move |app| {
+            glint.state.borrow_mut().display_timer = None;
+            glint.refresh_monitors(app);
+        });
+        self.state.borrow_mut().display_timer = Some(timer);
+    }
+
+    /// Re-reads the monitors and rebuilds the hidden overlay windows (after the open overlay, if one is open).
+    fn refresh_monitors(&self, app: &App) {
+        let started = Instant::now();
+        match glint_capture::monitors() {
+            Ok(monitors) => {
+                log::info!("monitors: {} in {:.1} ms", monitors.len(), started.elapsed().as_secs_f64() * 1000.0);
+                self.state.borrow_mut().monitors = monitors;
+            }
+            Err(error) => {
+                log::warn!("monitors: {error:#}");
+                return;
+            }
+        }
+        if self.state.borrow().busy == Busy::Overlay {
+            self.state.borrow_mut().pool_stale = true;
+        } else {
+            self.rebuild_overlay_pool(app);
+        }
+    }
+
+    fn rebuild_overlay_pool(&self, app: &App) {
+        let (old, monitors) = {
+            let mut state = self.state.borrow_mut();
+            state.pool_stale = false;
+            (state.overlay_pool.take(), state.monitors.clone())
+        };
+        if let Some(old) = old {
+            old.destroy(app);
+        }
+        if monitors.is_empty() {
+            return;
+        }
+        match OverlayPool::create(app, &monitors) {
+            Ok(pool) => self.state.borrow_mut().overlay_pool = Some(pool),
+            Err(error) => log::warn!("overlay pool: {error:#}; overlays will open new windows"),
+        }
     }
 
     // ---- snips started from the editor ---------------------------------------------------------------------
@@ -589,7 +759,7 @@ impl Glint {
         let intent = Intent::Overlay { mode, video: false };
         let glint = self.clone();
         let start = move |app: &App| {
-            let started = if delay_secs > 0 { glint.delay(app, delay_secs, intent) } else { glint.capture(app, intent) };
+            let started = if delay_secs > 0 { glint.delay(app, delay_secs, intent) } else { glint.capture(app, intent, Instant::now()) };
             if !started {
                 glint.restore_editors(true);
             }
@@ -622,7 +792,10 @@ impl Glint {
         }
     }
 
-    fn on_captured(&self, app: &App, intent: Intent, result: Result<Frozen>) {
+    fn on_captured(&self, app: &App, intent: Intent, generation: u64, result: Result<Frozen>) {
+        if let Intent::Overlay { .. } = intent {
+            return self.on_overlay_captured(app, generation, result);
+        }
         let frozen = match result {
             Ok(frozen) => frozen,
             Err(error) => {
@@ -645,37 +818,41 @@ impl Glint {
                     None => self.toast(app, Toast::new(ToastIcon::Symbol(glint_ui::Icon::AppWindow, Tint::Neutral), "No window to capture", None)),
                 }
             }
-            Intent::Overlay { mode, video } => {
-                let request = OverlayRequest {
-                    captures: frozen.captures,
-                    windows: frozen.windows,
-                    mode,
-                    video,
-                    show_magnifier: settings.capture.show_magnifier,
-                    delay_secs: settings.capture.delay_secs,
-                    hdr: settings.hdr.clone(),
-                    system_audio: settings.record.system_audio,
-                    microphone: settings.record.microphone,
-                };
-                self.state.borrow_mut().busy = Busy::Overlay;
-                let opened = glint_overlay::open_overlay(app, request, |app: &App, outcome, prefs| {
-                    app.post(AppEvent::OverlayClosed { outcome, prefs });
-                });
-                if let Err(error) = opened {
-                    self.state.borrow_mut().busy = Busy::Idle;
-                    self.restore_editors(true);
-                    self.error_toast(app, "Couldn't open the snip overlay", &error);
-                }
+            Intent::Overlay { .. } => {}
+        }
+    }
+
+    /// The open overlay that capture `generation` feeds.
+    fn overlay_session(&self, generation: u64) -> Option<OverlaySession> {
+        let state = self.state.borrow();
+        state.overlay.as_ref().filter(|(g, _)| *g == generation).map(|(_, s)| s.clone()).filter(OverlaySession::is_open)
+    }
+
+    /// The frozen desktop for the open overlay (dropped when that overlay already closed).
+    fn on_overlay_captured(&self, app: &App, generation: u64, result: Result<Frozen>) {
+        let Some(session) = self.overlay_session(generation) else {
+            log::info!("capture finished after its overlay closed; dropped");
+            return;
+        };
+        match result {
+            Ok(frozen) => session.set_captures(app, frozen.captures),
+            Err(error) => {
+                session.cancel(app);
+                self.error_toast(app, "Couldn't capture the screen", &error);
             }
         }
     }
 
     fn on_overlay_closed(&self, app: &App, outcome: OverlayOutcome, prefs: OverlayPrefs) {
-        let remembered = {
+        let (remembered, pool_stale) = {
             let mut state = self.state.borrow_mut();
             state.busy = Busy::Idle;
-            remember_overlay_choices(&mut state.settings, &prefs)
+            state.overlay = None;
+            (remember_overlay_choices(&mut state.settings, &prefs), state.pool_stale)
         };
+        if pool_stale {
+            self.rebuild_overlay_pool(app);
+        }
         if remembered {
             self.schedule_save(app);
             self.refresh_settings_window(app);
@@ -719,7 +896,7 @@ impl Glint {
     fn delay(&self, app: &App, secs: u32, intent: Intent) -> bool {
         match monitor_under_cursor() {
             Some(monitor) => self.countdown(app, &monitor, secs, CountdownPurpose::Recapture(intent)),
-            None => self.capture(app, intent),
+            None => self.capture(app, intent, Instant::now()),
         }
     }
 
@@ -751,7 +928,7 @@ impl Glint {
         }
         match purpose {
             CountdownPurpose::Recapture(intent) => {
-                if !self.capture(app, intent) {
+                if !self.capture(app, intent, Instant::now()) {
                     self.restore_editors(true);
                 }
             }
@@ -1476,16 +1653,14 @@ impl Glint {
 /// Posted to leave the loop after the current handler returned.
 struct QuitRequest;
 
-fn freeze(hdr: &HdrSettings, intent: Intent) -> Result<Frozen> {
-    let started = std::time::Instant::now();
+/// `early` gets each monitor's final SDR image as soon as it exists (on the capture threads).
+fn freeze(hdr: &HdrSettings, intent: Intent, early: &(dyn Fn(usize, &MonitorInfo, &Image) + Sync)) -> Result<Frozen> {
+    let started = Instant::now();
     let foreground = (intent == Intent::ActiveWindow).then(glint_capture::foreground_window).flatten();
-    let captures = glint_capture::capture_all(hdr)?;
-    let windows = match intent {
-        Intent::Overlay { .. } => glint_capture::windows_snapshot(Some(std::process::id())),
-        Intent::ActiveWindow => Vec::new(),
-    };
+    let captures: Vec<MonitorCapture> =
+        glint_capture::capture_all_streaming(hdr, early)?.into_iter().map(|(capture, _)| capture).collect();
     log::info!("froze {} monitors in {:?}", captures.len(), started.elapsed());
-    Ok(Frozen { captures, windows, foreground })
+    Ok(Frozen { captures, foreground })
 }
 
 /// A neutral 16:9 frame for a recording without a decoded first frame.

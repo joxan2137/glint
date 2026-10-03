@@ -1,67 +1,72 @@
 # glint-overlay API
 
-The frozen-screen selection overlay (DESIGN §6) and the delay countdown pill. UI thread only (`App` from glint-ui).
-All rects are physical pixels in virtual-desktop coordinates unless noted.
+The selection overlay (DESIGN §6) and the delay countdown pill. UI thread only (`App` from glint-ui). All rects are
+physical pixels in virtual-desktop coordinates unless noted.
 
 ```rust
-pub fn open_overlay(app: &App, request: OverlayRequest,
-                    done: impl FnOnce(&App, OverlayOutcome, OverlayPrefs) + 'static) -> anyhow::Result<()>;
-pub fn show_countdown(app: &App, monitor: &MonitorInfo, secs: u32, done: impl FnOnce(&App, bool) + 'static)
-    -> anyhow::Result<()>;
+pub struct OverlayPool;                 // hidden overlay windows, one per monitor, ready to show
+impl OverlayPool {
+    pub fn create(app: &App, monitors: &[MonitorInfo]) -> Result<OverlayPool>;   // startup + display changes
+    pub fn covers(&self, monitors: &[MonitorInfo]) -> bool;  pub fn monitors(&self) -> Vec<MonitorInfo>;
+    pub fn is_ready(&self, app: &App) -> bool;              pub fn destroy(&self, app: &App);
+    pub fn open(&self, app: &App, request: OverlayRequest, done: impl FnOnce(&App, OverlayOutcome, OverlayPrefs))
+        -> Result<OverlaySession>;      // new windows instead when the pool does not fit
+}
+pub fn open_overlay(app, request, done) -> Result<OverlaySession>;   // one-off windows, closed afterwards
+#[derive(Clone)] pub struct OverlaySession;
+impl OverlaySession {
+    pub fn set_captures(&self, app: &App, captures: Vec<MonitorCapture>);  // the freeze arrives
+    pub fn cancel(&self, app: &App);  pub fn is_open(&self) -> bool;  pub fn has_captures(&self) -> bool;
+}
+pub fn show_countdown(app, monitor: &MonitorInfo, secs: u32, done: impl FnOnce(&App, bool)) -> Result<()>;
 pub fn snip_rect(captures: &[MonitorCapture], rect_px: RectI, hdr: &HdrSettings, mode: CaptureMode) -> Option<Snip>;
+pub fn warm_up(gfx: &Rc<Gfx>, scales: &[f32]);     // OverlayPool::create calls it
 pub fn render_preview(gfx: &Gfx, kind: &str, theme: ThemeMode, scale: f32, captures: Option<&[MonitorCapture]>)
-    -> anyhow::Result<Image>;
-pub const PREVIEW_KINDS: [&str; 9];   // overlay, overlay-edge, overlay-window, overlay-full, overlay-freeform,
-                                      // overlay-video, overlay-color, overlay-menu, countdown
+    -> Result<Image>;
+pub const PREVIEW_KINDS: [&str; 11];
 ```
 
-## open_overlay
-- One `WindowSpec::overlay(monitor.rect)` per capture, each showing its frozen `sdr` (moved, not copied) dimmed by
-  `theme.overlay_dim`; the toolbar monitor's window opens last so it takes focus. `Err` (and `done` is never called)
-  only when no capture was given or no window could be opened.
-- `done` runs exactly once, on a zero-delay timer after the last overlay window closed (120 ms fade first; windows
-  still open 400 ms after the session ended are closed directly, and `done` fires even if one never closes). The
-  outcome is built then: crops, region tone mapping and the freeform mask never delay the fade.
-- `OverlayPrefs` always reflects the final mode, video flag, delay, magnifier and audio toggles: persist it.
-- `request.mode`/`video` are normalised: video only with Rectangle, Window or Full screen (else Rectangle).
-- `request.delay_secs` only checks the menu item. Picking 3/5/10 s ends with `Delay { secs }`; picking
-  "No delay" just sets `prefs.delay_secs = 0`.
+`OverlayRequest { monitors, captures, windows, mode, video, show_magnifier, delay_secs, hdr, system_audio,
+microphone, requested_at }`: `monitors` = the windows to open (empty: the captures' monitors); `captures` may be
+empty; `requested_at` = hotkey time for latency logs.
 
-Outcomes:
+## Instant overlay, late freeze
+- Overlay windows use `exclude_from_capture`, so they open before capturing. Pending state: transparent over the live
+  desktop with the dim, solid-glass toolbar, hover highlights from `windows`, drags, Text/Video work; magnifier and
+  color sample wait for pixels. `set_captures` swaps the frozen image in under the dim (same pixels) and crossfades
+  the controls to frosted glass in 140 ms. Captures are matched to monitors by rect, then device name.
+- An ending that needs pixels (selection, lasso, color) waits with a "Capturing…" pill and progress cursor, then
+  completes when the captures arrive; Esc / right-click still cancel. `cancel` (capture failed) ends with
+  `Cancelled`. Record, Delay and Cancel never wait.
+- Pool: windows are created hidden with their swapchain rendered (`Ctx::render_hidden`) and the controls' text,
+  icon and shadow caches warmed. `open` resets the views, raises them above newer topmost popups and shows; the first
+  frame is a dim fill only (no upload, no blur). At session end the last frame is empty, then the window hides
+  (reused next time). Rebuild the pool when monitors or DPI change; `open` falls back to new windows otherwise.
+- `done` runs exactly once after every window left the session (120 ms fade; windows still in it 400 ms after the
+  end are hidden or closed directly). The outcome (crops, region tone mapping, lasso mask) is built then.
+- Info logs: `monitor N on screen X ms after the request`, `first frame painted in X ms`, `captures delivered X ms
+  after the request`.
+
+## Outcomes
 | User action | Outcome |
 |---|---|
-| Esc, right-click, ✕, Cancel in the record bar, Alt+F4 | `Cancelled` |
+| Esc, right-click, ✕, Cancel in the record bar, Alt+F4, `cancel` | `Cancelled` |
 | Rectangle drag ≥ 4×4 px, Window click, Full-screen click, Ctrl+click (all monitors stitched), Enter | `Snip(snip)` |
-| Freeform lasso (bounding box, alpha 0 outside the antialiased path) | `Snip(snip)` with `mode = Freeform` |
-| Text mode drag (or Enter = whole monitor) | `Text(snip)` (app runs OCR) |
-| Color mode click / Enter | `Color { bgra }` from the frozen image |
-| Video: region (drag / window / monitor) then Record or Enter | `Record(RecordRegion)` (region monitor-relative) |
+| Freeform lasso (bounding box, alpha 0 outside; `hdr`/`hdr_stats` None) | `Snip(snip)`, `mode = Freeform` |
+| Text mode drag (Enter = whole monitor) | `Text(snip)` |
+| Color mode click / Enter | `Color { bgra }` |
+| Video: region (drag / window / monitor), then Record or Enter | `Record(RecordRegion)` (monitor-relative) |
 | Delay menu 3/5/10 s | `Delay { secs }` |
 
-`Snip.mode` is Rectangle, Window, FullScreen (also Enter in Rectangle mode), Freeform or Text.
+`OverlayPrefs` always carries the final mode, video flag, delay, magnifier and audio toggles. Keys: R W F L T C
+modes, V photo/video, M magnifier, Space Rectangle/Window (while dragging: move), Shift square, arrows nudge 1 px
+(Shift 10), Enter captures (no key repeat), Esc cancels, Ctrl in Full screen = all monitors.
 
-Keys: R W F L T C mode, V photo/video, M magnifier, Space toggles Rectangle/Window (while dragging: move the
-selection), Shift square, arrows nudge the cursor 1 px (Shift 10), Enter captures the hovered window/monitor (or
-records the armed region), Esc cancels. Ctrl held in Full screen highlights every monitor.
-
-## snip_rect
-`rect_px` is clipped to the area the monitors cover; `None` if it touches no monitor. One monitor: crop; for HDR
-monitors the region is re-tone-mapped with its own stats (bit-identical to `tonemap_region`) and `hdr`/`hdr_stats`
-hold the raw crop and its stats. Several monitors: parts placed side by side (HDR parts re-tone-mapped per part),
-uncovered gaps alpha 0, `hdr = None`. `monitor` = largest overlap.
-
-## show_countdown
-Glass capsule (digit + ✕) at the top center of `monitor`, `exclude_from_capture`, topmost, non-activating.
-Ticks on absolute one-second deadlines; `done(app, true)` at zero (window closes at once, so capture right away),
-`done(app, false)` on ✕ or if the window is closed early. `secs == 0` calls `done(app, true)` on the next turn.
-
-## render_preview
-Deterministic offscreen render (no window) of one state at `scale`, dark overlay; `theme` only affects `countdown`.
-Synthetic desktop with fake windows when `captures` is `None`; otherwise the primary capture plus a live
-`windows_snapshot`. `gfx` must come from `Gfx::new` (uses `Gfx::shared`).
-
-`cargo run -p glint-overlay --release --example preview -- --out <dir> [--live]` writes every kind at scale 1 and 2.
-
-## Cost
-Per monitor on the UI thread, warm process, 2560×1440: ~4 ms first frame (upload + paint), ~5 ms for the frame
-that first shows the toolbar (glass backdrop blur, cached afterwards). Cold process: ~15 ms each.
+## snip_rect, countdown, previews
+- `snip_rect`: clipped to the covered area; one monitor = crop (HDR: region re-tone-mapped, raw crop + stats);
+  several = side by side, gaps alpha 0, `hdr` None; `monitor` = largest overlap.
+- `show_countdown`: glass capsule at the top center, excluded from capture; only the pill takes clicks
+  (`interactive_region`); `done(app, true)` at zero, `false` on ✕ or early close.
+- Previews: synthetic desktop unless `captures`; `overlay-pending` / `overlay-busy` show the live-desktop states.
+  `cargo run -p glint-overlay --release --example preview -- --out <dir> [--live]`.
+- Latency probe: `cargo test -p glint-overlay --release latency -- --ignored --nocapture`.

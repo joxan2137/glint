@@ -1,14 +1,37 @@
 use std::mem::size_of;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use glint_core::{Image, RectI};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
     DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ROP_CODE, ReleaseDC, SRCCOPY, SelectObject,
 };
+use windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL;
+
+use crate::threads;
+
+/// A BitBlt normally takes 20 to 50 ms; it was seen to block for two minutes once, so it runs on a helper thread that is
+/// abandoned (it finishes or dies on its own) when the answer takes longer than this.
+const BLIT_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// SDR-only BitBlt of `rect` (virtual-desktop physical pixels) from the screen DC, layered windows included.
 pub fn grab(rect: RectI) -> Result<Image> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("glint-gdi-blit".into())
+        .spawn(move || {
+            threads::set_current_priority(THREAD_PRIORITY_ABOVE_NORMAL);
+            let _ = sender.send(grab_blocking(rect));
+        })
+        .context("start the GDI capture thread")?;
+    receiver
+        .recv_timeout(BLIT_TIMEOUT)
+        .map_err(|_| anyhow!("GDI BitBlt did not finish within {} ms", BLIT_TIMEOUT.as_millis()))?
+}
+
+fn grab_blocking(rect: RectI) -> Result<Image> {
     ensure!(!rect.is_empty(), "cannot capture an empty rect");
     let screen = ScreenDc::acquire()?;
     let memory = MemoryDc::compatible_with(&screen)?;

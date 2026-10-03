@@ -61,7 +61,8 @@ current pill rect (e.g. `vec![toolbar.rect()]`, plus an open menu's frame); touc
 `gfx()`, `app() -> Option<&App>` (None offscreen), `window()`, `hwnd()`, `is_offscreen()`, `request_paint()`,
 `animate()` (one more frame; call every paint for continuous motion), `set_cursor(Cursor)`, `capture_pointer()` /
 `release_pointer()` (primary presses auto-capture until release), `close()`, `set_window_rect_px(RectI)`,
-`move_window_px(PointI)`, `resize_window(SizeF)`, `show_window(activate)`, `hide_window()`,
+`move_window_px(PointI)`, `resize_window(SizeF)`, `show_window(activate)`, `hide_window()`, `render_hidden()` (one
+frame while hidden: swapchain ready for an instant later show),
 `set_window_opacity(f32)` (composition visual, no repaint), `set_topmost`, `set_title`, `minimize`,
 `toggle_maximize`, `activate()` (robust foreground + focus, as overlays get on show), `post(e)`,
 `set_timer(Duration, token) -> TimerId` (→ `Event::Timer(token)`), `cancel_timer`,
@@ -119,7 +120,8 @@ size_dip, scale, theme)` or `::pixels(w_px, h_px, scale, theme)` (full-resolutio
 `.time(t)` (deterministic animation clock), `.background(color)`. Limit: `gfx.max_bitmap_size()` per side.
 `Gfx::new()` (WARP fallback; `new_software()`), `shared() -> Option<Rc<Gfx>>` (the owning `Rc`, for `&Gfx` callers of
 `render_offscreen`), `factory()`, `dwrite()`, `wic()`, `context()`, `d3d_device()`,
-`generation()`, `text_layout()`, `measure_text()`, `font_families()`. Use `app.gfx()` inside a running app.
+`generation()`, `text_layout()`, `measure_text()`, `font_families()`. Use `app.gfx()` inside a running app. Device
+creation raises `IDXGIDevice::SetGPUThreadPriority` to the highest permitted value (7…1, logged; needs privilege).
 
 ## Animation and theme
 `Animated<T>` for `f32`, `PointF`, `SizeF`, `RectF`, `Color`: `Animated::new(v)` (spring 420/0.86), `::snappy(v)`

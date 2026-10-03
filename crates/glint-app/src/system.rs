@@ -1,21 +1,26 @@
 //! Small safe wrappers around the Win32 calls the app needs beyond glint-ui and glint-sys.
 
 use anyhow::{Context, Result, ensure};
-use glint_core::{Image, MonitorInfo, PointI};
+use glint_core::{Image, MonitorInfo, PointI, RectI};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
-    HGDIOBJ,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
+    EnumDisplayMonitors, HBITMAP, HDC, HGDIOBJ, HMONITOR,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Threading::{
+    ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority,
+    THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
+};
+use windows_core::BOOL;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, GetCursorPos, HICON, ICONINFO, IsWindow, IsWindowVisible, MSG, PM_NOREMOVE,
@@ -37,6 +42,49 @@ pub fn cursor_pos() -> PointI {
     // SAFETY: out-pointer to a valid POINT.
     let _ = unsafe { GetCursorPos(&mut point) };
     PointI::new(point.x, point.y)
+}
+
+/// Monitor rects from `EnumDisplayMonitors` (microseconds; no DXGI or display-config queries), to check that a
+/// cached monitor list still matches the layout.
+pub fn display_rects() -> Vec<RectI> {
+    unsafe extern "system" fn collect(_: HMONITOR, _: HDC, rect: *mut RECT, data: LPARAM) -> BOOL {
+        // SAFETY: `data` is the Vec passed below and `rect` points to the monitor rect, both valid during the call.
+        unsafe {
+            let rects = &mut *(data.0 as *mut Vec<RectI>);
+            let r = *rect;
+            rects.push(RectI::from_ltrb(r.left, r.top, r.right, r.bottom));
+        }
+        true.into()
+    }
+    let mut rects: Vec<RectI> = Vec::new();
+    // SAFETY: the callback only writes into `rects`, which outlives the enumeration.
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut rects as *mut Vec<RectI> as isize)) };
+    rects
+}
+
+/// Snipping must feel instant while a game saturates the CPU: the process runs above normal (idle cost is zero)
+/// and the UI thread at the highest normal priority.
+pub fn raise_ui_priority() {
+    // SAFETY: plain calls on pseudo handles of this process and thread.
+    let (process, thread) = unsafe {
+        (
+            SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS),
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST),
+        )
+    };
+    log::info!("priority: process above normal {:?}, UI thread highest {:?}", process.is_ok(), thread.is_ok());
+}
+
+/// Worker threads on the capture path (they still yield to the UI thread).
+pub fn raise_worker_priority() {
+    set_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+fn set_thread_priority(priority: THREAD_PRIORITY) {
+    // SAFETY: plain call on the pseudo handle of the calling thread.
+    if let Err(error) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
+        log::warn!("thread priority: {error}");
+    }
 }
 
 /// The monitor that contains `point`, else the primary, else the first.

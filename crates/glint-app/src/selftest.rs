@@ -61,7 +61,7 @@ pub fn run(json_output: bool) -> i32 {
             return 2;
         }
     };
-    let mut checks = vec![timed("monitors", monitors)];
+    let mut checks = vec![timed("monitors", monitors), timed("hotkey path", hotkey_path)];
     checks.extend(captures(&out));
     checks.push(timed("tonemap 3840x2160", tone_map));
     checks.push(timed("encode round trip", encode_round_trip));
@@ -112,6 +112,21 @@ fn monitors() -> Result<String> {
         })
         .collect();
     Ok(format!("{}: {}", monitors.len(), lines.join("; ")))
+}
+
+/// What the shortcut does synchronously before the overlay paints: the layout check against the cached monitors
+/// and the window snapshot for hover highlights.
+fn hotkey_path() -> Result<String> {
+    let monitors = glint_capture::monitors()?;
+    let started = Instant::now();
+    let rects = crate::system::display_rects();
+    let dpi_ok = monitors.iter().all(|m| glint_ui::win::dpi_for_rect(m.rect) == m.dpi);
+    let layout_ms = started.elapsed().as_secs_f64() * 1000.0;
+    ensure!(rects.len() == monitors.len() && dpi_ok, "display layout check disagrees with monitors()");
+    let started = Instant::now();
+    let windows = glint_capture::windows_snapshot(Some(std::process::id()));
+    let snapshot_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(format!("layout check {layout_ms:.3} ms, window snapshot {snapshot_ms:.2} ms ({} windows)", windows.len()))
 }
 
 /// Share of pixels brighter than near-black, so a broken capture (all zeros) fails.

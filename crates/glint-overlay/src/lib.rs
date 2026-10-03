@@ -5,28 +5,29 @@ mod countdown;
 mod freeform;
 mod geometry;
 mod magnifier;
+mod pool;
 mod preview;
 mod snip;
 mod state;
 mod sys;
 mod view;
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Instant;
 
-use anyhow::{bail, ensure};
 use glint_core::settings::HdrSettings;
 use glint_core::{CaptureMode, HdrImage, HdrStats, Image, MonitorCapture, MonitorInfo, RectI, ThemeMode, WindowInfo};
-use glint_ui::{App, Gfx, WindowSpec};
+use glint_ui::{App, Gfx};
 
+pub use pool::{OverlayPool, OverlaySession, warm_up};
 pub use preview::KINDS as PREVIEW_KINDS;
 
 use crate::snip::Source;
-use crate::state::{Frozen, Session};
-use crate::view::OverlayView;
 
 pub struct OverlayRequest {
+    /// Monitors to cover, one overlay window each (`glint_capture::monitors()`). Empty: the captures' monitors.
+    pub monitors: Vec<MonitorInfo>,
+    /// The frozen desktop when already captured. May be empty: the overlay opens over the live desktop and
+    /// `OverlaySession::set_captures` hands the pixels over when they are ready.
     pub captures: Vec<MonitorCapture>,
     pub windows: Vec<WindowInfo>,
     pub mode: CaptureMode,
@@ -37,6 +38,8 @@ pub struct OverlayRequest {
     pub hdr: HdrSettings,
     pub system_audio: bool,
     pub microphone: bool,
+    /// When the user asked for the overlay (hotkey press); latencies are logged against it.
+    pub requested_at: Option<Instant>,
 }
 
 /// A finished image capture.
@@ -83,42 +86,15 @@ pub struct OverlayPrefs {
     pub microphone: bool,
 }
 
-/// Opens one overlay window per monitor. `done` runs exactly once, after every overlay window has closed.
+/// Opens one overlay window per monitor (excluded from capture, so it may open before the desktop is captured) for
+/// this session only. `done` runs exactly once, after every overlay window has closed. Prefer
+/// `OverlayPool::open`, which shows windows prepared in advance.
 pub fn open_overlay(
     app: &App,
     request: OverlayRequest,
     done: impl FnOnce(&App, OverlayOutcome, OverlayPrefs) + 'static,
-) -> anyhow::Result<()> {
-    let started = Instant::now();
-    let OverlayRequest { captures, windows, mode, video, show_magnifier, delay_secs, hdr, system_audio, microphone } = request;
-    ensure!(!captures.is_empty(), "no monitor captures to show");
-    let frozen: Vec<Frozen> =
-        captures.into_iter().map(|c| Frozen { info: c.monitor, sdr: Rc::new(c.sdr), hdr: c.hdr }).collect();
-    let prefs = OverlayPrefs { mode, video, delay_secs, show_magnifier, system_audio, microphone };
-    let session = Session::new(frozen, windows, hdr, prefs, sys::cursor_pos());
-    let toolbar_monitor = session.toolbar_monitor;
-    let rects = session.monitor_rects.clone();
-    let shared = Rc::new(RefCell::new(session));
-    shared.borrow_mut().done = Some(Box::new(done));
-    let theme = app.theme_for(ThemeMode::Dark);
-    let last_shown_gets_focus = (0..rects.len()).filter(|&i| i != toolbar_monitor).chain([toolbar_monitor]);
-    for i in last_shown_gets_focus {
-        let view = OverlayView::new(shared.clone(), i, &theme);
-        match app.open(WindowSpec::overlay(rects[i]), view) {
-            Ok(id) => {
-                let mut s = shared.borrow_mut();
-                s.window_ids.push(id);
-                s.open_windows += 1;
-            }
-            Err(e) => log::error!("overlay window for monitor {i}: {e:#}"),
-        }
-    }
-    if shared.borrow().open_windows == 0 {
-        shared.borrow_mut().done = None;
-        bail!("no overlay window could be opened");
-    }
-    log::debug!("overlay: {} window(s) opened in {:.1} ms", rects.len(), started.elapsed().as_secs_f64() * 1000.0);
-    Ok(())
+) -> anyhow::Result<OverlaySession> {
+    pool::open_fresh(app, request, Box::new(done))
 }
 
 /// Countdown pill (excluded from capture) at the top center of `monitor`. `done(app, completed)`:
@@ -141,8 +117,8 @@ pub fn snip_rect(captures: &[MonitorCapture], rect_px: RectI, hdr: &HdrSettings,
 }
 
 /// Offscreen render of an overlay state for visual checks: `overlay`, `overlay-window`, `overlay-full`,
-/// `overlay-freeform`, `overlay-video`, `overlay-color`, `overlay-menu`, `countdown` (plus `overlay-edge`;
-/// all names in `PREVIEW_KINDS`).
+/// `overlay-freeform`, `overlay-video`, `overlay-color`, `overlay-menu`, `countdown` (plus `overlay-edge`,
+/// `overlay-pending` and `overlay-busy`; all names in `PREVIEW_KINDS`).
 /// Uses `captures` when given, else a synthetic desktop.
 pub fn render_preview(
     gfx: &Gfx,

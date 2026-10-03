@@ -267,6 +267,7 @@ pub(crate) struct WindowState {
     presented: Cell<bool>,
     show_pending: Cell<Option<bool>>,
     hidden: Cell<bool>,
+    render_hidden: Cell<bool>,
     cursor: Cell<Cursor>,
     hovering: Cell<bool>,
     buttons_down: Cell<bool>,
@@ -289,7 +290,7 @@ impl WindowState {
     }
 
     pub(crate) fn wants_render(&self) -> bool {
-        self.needs_frame.get() && (!self.hidden.get() || self.show_pending.get().is_some())
+        self.needs_frame.get() && (!self.hidden.get() || self.show_pending.get().is_some() || self.render_hidden.get())
     }
 
     fn scale(&self) -> f32 {
@@ -407,6 +408,7 @@ pub(crate) fn open(app: &App, spec: WindowSpec, view: Box<dyn View>) -> Result<W
         presented: Cell::new(false),
         show_pending: Cell::new(spec.visible.then_some(spec.activates())),
         hidden: Cell::new(true),
+        render_hidden: Cell::new(false),
         cursor: Cell::new(Cursor::Arrow),
         hovering: Cell::new(false),
         buttons_down: Cell::new(false),
@@ -628,6 +630,7 @@ fn try_render(app: &App, win: &Rc<WindowState>, time: f64) -> Result<()> {
         unsafe { surface.swapchain.Present(1, DXGI_PRESENT(0)).ok()? };
     }
     win.needs_frame.set(animating);
+    win.render_hidden.set(false);
     if !win.presented.replace(true) {
         let dcomp = gfx.dcomp()?;
         // SAFETY: committing and waiting on our own composition device.
@@ -763,6 +766,12 @@ fn apply_op(app: &App, win: &Rc<WindowState>, op: WindowOp) {
                 win.hidden.set(true);
                 win.show_pending.set(None);
                 let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            WindowOp::RenderHidden => {
+                if win.hidden.get() {
+                    win.render_hidden.set(true);
+                    app.request_frame(win);
+                }
             }
             WindowOp::Activate => {
                 win::force_foreground(raw);

@@ -6,21 +6,23 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
 use glint_core::settings::HdrSettings;
-use glint_core::{CaptureMode, Image, MonitorCapture, MonitorInfo, PointF, RectF, RectI, SizeF, ThemeMode, WindowInfo};
+use glint_core::{CaptureMode, HdrImage, Image, MonitorCapture, MonitorInfo, PointF, RectF, RectI, SizeF, ThemeMode, WindowInfo};
 use glint_ui::{
     Bitmap, Brush, Color, Gfx, Icon, Interpolation, OffscreenSpec, Painter, PathBuilder, Shadow, StrokeStyle, TextStyle, Theme,
-    Weight, render_offscreen, render_view_offscreen,
+    View, Weight, render_offscreen,
 };
 
 use crate::OverlayPrefs;
 use crate::countdown::{self, CountdownView};
 use crate::freeform::Lasso;
 use crate::geometry::{Selection, Space};
-use crate::state::{Armed, Frozen, Gesture, Session};
+use crate::state::{Armed, Finish, Gesture, Session};
 use crate::view::OverlayView;
 
-pub const KINDS: [&str; 9] = [
+pub const KINDS: [&str; 11] = [
     "overlay",
+    "overlay-pending",
+    "overlay-busy",
     "overlay-edge",
     "overlay-window",
     "overlay-full",
@@ -36,9 +38,17 @@ const WARM_TIME: f64 = 1000.0;
 const SETTLED_TIME: f64 = WARM_TIME + 5.0;
 
 struct Desktop {
-    frozen: Frozen,
+    monitor: MonitorInfo,
+    image: Rc<Image>,
+    hdr: Option<HdrImage>,
     windows: Vec<WindowInfo>,
     size: SizeF,
+}
+
+impl Desktop {
+    fn capture(&self) -> MonitorCapture {
+        MonitorCapture { monitor: self.monitor.clone(), sdr: (*self.image).clone(), hdr: self.hdr.clone(), hdr_stats: None }
+    }
 }
 
 pub fn render(gfx: &Gfx, kind: &str, theme: ThemeMode, scale: f32, captures: Option<&[MonitorCapture]>) -> Result<Image> {
@@ -62,11 +72,12 @@ fn at(size: SizeF, fx: f32, fy: f32) -> PointF {
 
 fn render_overlay(gfx: &Rc<Gfx>, desktop: Desktop, kind: &str, scale: f32) -> Result<Image> {
     let size = desktop.size;
-    let monitor = desktop.frozen.info.rect;
+    let monitor = desktop.monitor.rect;
+    let pending = matches!(kind, "overlay-pending" | "overlay-busy");
     let space = Space::new(monitor, scale);
     let px = |p: PointF| space.to_px(p);
     let mode = match kind {
-        "overlay-window" => CaptureMode::Window,
+        "overlay-window" | "overlay-pending" => CaptureMode::Window,
         "overlay-full" => CaptureMode::FullScreen,
         "overlay-freeform" => CaptureMode::Freeform,
         "overlay-color" => CaptureMode::ColorPicker,
@@ -83,14 +94,21 @@ fn render_overlay(gfx: &Rc<Gfx>, desktop: Desktop, kind: &str, scale: f32) -> Re
     let cursor = match kind {
         "overlay" => at(size, 0.68, 0.6),
         "overlay-edge" => PointF::new(size.w - 0.1, size.h - 0.1),
-        "overlay-window" => at(size, 0.56, 0.5),
+        "overlay-window" | "overlay-pending" => at(size, 0.56, 0.5),
         "overlay-full" => at(size, 0.5, 0.62),
         "overlay-color" => at(size, 0.22, 0.36),
         "overlay-menu" => at(size, 0.52, 0.2),
         _ => at(size, 0.5, 0.5),
     };
-    let mut session = Session::new(vec![desktop.frozen], desktop.windows, HdrSettings::default(), prefs, Some(px(cursor)));
+    let mut session = Session::new(vec![desktop.monitor.clone()], desktop.windows.clone(), HdrSettings::default(), prefs, Some(px(cursor)));
+    if !pending {
+        session.attach(vec![desktop.capture()]);
+    }
     match kind {
+        "overlay-busy" => {
+            let rect = RectI::from_points(px(at(size, 0.45, 0.3)), px(at(size, 0.8, 0.7)));
+            session.finish = Some(Finish::Region { rect, mode: CaptureMode::Rectangle, lasso: None });
+        }
         "overlay" | "overlay-edge" => {
             let anchor = if kind == "overlay" { at(size, 0.39, 0.33) } else { at(size, 0.74, 0.71) };
             let mut selection = Selection::begin(monitor, px(anchor));
@@ -124,9 +142,16 @@ fn render_overlay(gfx: &Rc<Gfx>, desktop: Desktop, kind: &str, scale: f32) -> Re
     }
 
     let shared = Rc::new(RefCell::new(session));
-    let mut view = OverlayView::new(shared, 0, &Theme::dark());
+    let mut view = OverlayView::attached(shared, 0);
     let spec = OffscreenSpec::pixels(monitor.w as u32, monitor.h as u32, scale, Theme::dark());
-    render_view_offscreen(gfx, &mut view, &spec.clone().time(WARM_TIME))?;
+    let live_desktop = Bitmap::from_shared(desktop.image.clone());
+    let frame = |view: &mut OverlayView, time: f64| {
+        render_offscreen(gfx, &spec.clone().time(time), |cx, p| {
+            p.bitmap(&live_desktop, p.bounds(), None, 1.0, Interpolation::Nearest);
+            view.paint(cx, p);
+        })
+    };
+    frame(&mut view, WARM_TIME)?;
     match kind {
         "overlay-window" => {
             if let Some(modes) = view.toolbar.segmented_mut("mode") {
@@ -143,13 +168,13 @@ fn render_overlay(gfx: &Rc<Gfx>, desktop: Desktop, kind: &str, scale: f32) -> Re
         "overlay-video" => view.record_bar.force_hover_record(),
         _ => {}
     }
-    render_view_offscreen(gfx, &mut view, &spec.time(SETTLED_TIME))
+    frame(&mut view, SETTLED_TIME)
 }
 
 fn render_countdown(gfx: &Rc<Gfx>, desktop: &Desktop, theme: ThemeMode, scale: f32) -> Result<Image> {
     let theme = Theme::resolve(theme, glint_ui::theme::system_prefers_dark());
     let size = countdown::window_size();
-    let background = Bitmap::from_shared(desktop.frozen.sdr.clone());
+    let background = Bitmap::from_shared(desktop.image.clone());
     let behind = RectF::new(-(desktop.size.w - size.w) / 2.0, -countdown::WINDOW_TOP, desktop.size.w, desktop.size.h);
     let mut view = CountdownView::new(3, None);
     let mut frame = |time: f64| {
@@ -168,7 +193,9 @@ fn live_desktop(captures: &[MonitorCapture], scale: f32) -> Result<Desktop> {
     let windows = glint_capture::windows_snapshot(Some(std::process::id()));
     let rect = capture.monitor.rect;
     Ok(Desktop {
-        frozen: Frozen { info: capture.monitor.clone(), sdr: Rc::new(capture.sdr.clone()), hdr: capture.hdr.clone() },
+        monitor: capture.monitor.clone(),
+        image: Rc::new(capture.sdr.clone()),
+        hdr: capture.hdr.clone(),
         windows,
         size: SizeF::new(rect.w as f32 / scale, rect.h as f32 / scale),
     })
@@ -212,7 +239,7 @@ fn synthetic_desktop(gfx: &Rc<Gfx>, scale: f32) -> Result<Desktop> {
         primary: true,
         hdr: None,
     };
-    Ok(Desktop { frozen: Frozen { info, sdr: Rc::new(image), hdr: None }, windows, size: DESKTOP })
+    Ok(Desktop { monitor: info, image: Rc::new(image), hdr: None, windows, size: DESKTOP })
 }
 
 fn hex(text: &str) -> Color {

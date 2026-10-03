@@ -3,13 +3,17 @@
 //! touches neither clipboard nor registry.
 //!
 //! cargo run -p glint-capture --release --example probe -- --out <dir> [--runs N] [--warm] [--order dda,wgc,gdi]
-//!     [--compare-gdi] [--wgc] [--verbose]
+//!     [--compare-gdi] [--wgc] [--cpu-tonemap]
+//!     [--burn-cpu N] [--verbose]
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use glint_capture::{CaptureMethod, CaptureReport, capture_all_via, capture_monitor_gdi, capture_monitor_wgc};
+use glint_capture::{
+    CaptureMethod, CaptureReport, capture_all_streaming, capture_all_via, capture_monitor_gdi, capture_monitor_wgc,
+};
 use glint_core::settings::HdrSettings;
 use glint_core::{Image, ImageFormat, MonitorCapture, MonitorInfo, WindowInfo};
 use serde_json::{Value, json};
@@ -22,8 +26,10 @@ struct Args {
     out: PathBuf,
     runs: usize,
     warm: bool,
-    order: Vec<CaptureMethod>,
+    order: Option<Vec<CaptureMethod>>,
     compare_gdi: bool,
+    cpu_tonemap: bool,
+    burn_cpu: usize,
     wgc: bool,
     verbose: bool,
 }
@@ -33,8 +39,10 @@ fn parse_args() -> Result<Args> {
         out: std::env::temp_dir().join("glint-probe"),
         runs: DEFAULT_RUNS,
         warm: false,
-        order: CaptureMethod::DEFAULT_ORDER.to_vec(),
+        order: None,
         compare_gdi: false,
+        cpu_tonemap: false,
+        burn_cpu: 0,
         wgc: false,
         verbose: false,
     };
@@ -46,10 +54,12 @@ fn parse_args() -> Result<Args> {
             "--warm" => args.warm = true,
             "--order" => {
                 let list = iter.next().context("--order needs a comma separated list")?;
-                args.order = list.split(',').map(str::parse).collect::<Result<_>>()?;
+                args.order = Some(list.split(',').map(str::parse).collect::<Result<_>>()?);
             }
             "--compare-gdi" => args.compare_gdi = true,
             "--wgc" => args.wgc = true,
+            "--cpu-tonemap" => args.cpu_tonemap = true,
+            "--burn-cpu" => args.burn_cpu = iter.next().context("--burn-cpu needs a thread count")?.parse()?,
             "--verbose" => args.verbose = true,
             other => bail!("unknown argument {other}"),
         }
@@ -79,6 +89,8 @@ fn main() -> Result<()> {
     log::set_logger(&StderrLogger).ok();
     log::set_max_level(if args.verbose { log::LevelFilter::Debug } else { log::LevelFilter::Info });
     glint_capture::enable_per_monitor_dpi_awareness();
+    glint_capture::set_gpu_tonemap(!args.cpu_tonemap);
+    burn_cpu(args.burn_cpu);
     std::fs::create_dir_all(&args.out).with_context(|| format!("create {}", args.out.display()))?;
 
     let monitors = glint_capture::monitors()?;
@@ -95,12 +107,25 @@ fn main() -> Result<()> {
     let mut captures = Vec::new();
     for run in 1..=args.runs {
         let started = Instant::now();
-        captures = capture_all_via(&settings, &args.order)?;
+        let sdr_ready: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+        let on_sdr = |index: usize, _: &MonitorInfo, _: &Image| {
+            sdr_ready.lock().unwrap().push((index, ms(started.elapsed())));
+        };
+        captures = match &args.order {
+            Some(order) => capture_all_via(&settings, order)?,
+            None => capture_all_streaming(&settings, &on_sdr)?,
+        };
+        let wall = ms(started.elapsed());
+        let sdr_ready = sdr_ready.into_inner().unwrap();
         let per_monitor: Vec<String> = captures
             .iter()
-            .map(|(capture, report)| format!("{} {} {:.0} ms", capture.monitor.device_name, report.path, ms(report.total)))
+            .enumerate()
+            .map(|(index, (capture, report))| {
+                let ready = sdr_ready.iter().find(|(i, _)| *i == index).map_or(String::new(), |(_, t)| format!(", sdr at {t:.0}"));
+                format!("{} {} {:.0} ms{ready}", capture.monitor.device_name, report.path, ms(report.total))
+            })
             .collect();
-        println!("capture_all run {run}: {:.1} ms wall [{}]", ms(started.elapsed()), per_monitor.join(" | "));
+        println!("capture_all run {run}: {wall:.1} ms wall [{}]", per_monitor.join(" | "));
     }
 
     println!();
@@ -109,6 +134,18 @@ fn main() -> Result<()> {
     }
     println!("\noutput: {}", args.out.display());
     Ok(())
+}
+
+/// Spins `threads` normal-priority threads for the rest of the process to imitate a game saturating the CPU.
+fn burn_cpu(threads: usize) {
+    for _ in 0..threads {
+        std::thread::spawn(|| {
+            let mut value = 1u64;
+            loop {
+                value = std::hint::black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
+            }
+        });
+    }
 }
 
 fn print_monitors(monitors: &[MonitorInfo]) {
@@ -176,6 +213,15 @@ fn report_capture(index: usize, capture: &MonitorCapture, report: &CaptureReport
         ms(report.grab),
         ms(report.tonemap),
         ms(report.total)
+    );
+    let stages = &report.stages;
+    println!(
+        "  stages: setup {:.1} ms, acquire {:.1}, copy+map {:.1}, convert {:.1}, tone map {:.1}",
+        ms(stages.setup),
+        ms(stages.acquire),
+        ms(stages.copy_map),
+        ms(stages.convert),
+        ms(stages.tonemap)
     );
     if let Some(reason) = &report.fallback_reason {
         println!("  earlier paths abandoned: {reason}");

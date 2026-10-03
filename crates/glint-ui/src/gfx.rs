@@ -96,6 +96,7 @@ fn create_devices(factory: &ID2D1Factory1, force_software: bool) -> Result<Devic
         _ => (create_d3d_device(D3D_DRIVER_TYPE_WARP).context("creating WARP D3D11 device")?, true),
     };
     let dxgi_device: IDXGIDevice = d3d.cast()?;
+    raise_gpu_priority(&dxgi_device);
     // SAFETY: plain COM calls on live interfaces.
     unsafe {
         let dxgi_factory: IDXGIFactory2 = dxgi_device.GetAdapter()?.GetParent()?;
@@ -107,6 +108,16 @@ fn create_devices(factory: &ID2D1Factory1, force_software: bool) -> Result<Devic
         }
         let max_bitmap_size = context.GetMaximumBitmapSize();
         Ok(Devices { d3d, dxgi_device, dxgi_factory, d2d_device, context, aux_context, dcomp: None, max_bitmap_size, software })
+    }
+}
+
+/// Lets our small UI frames overtake a busy game's GPU queue: the highest `SetGPUThreadPriority` the process may use
+/// (positive values need the increase-base-priority privilege, so this often stays at 0 without elevation).
+fn raise_gpu_priority(device: &IDXGIDevice) {
+    // SAFETY: plain COM call on a live device.
+    match (1..=7).rev().find(|&priority| unsafe { device.SetGPUThreadPriority(priority) }.is_ok()) {
+        Some(priority) => log::info!("GPU thread priority {priority}"),
+        None => log::info!("GPU thread priority unchanged (raising it is not permitted for this process)"),
     }
 }
 

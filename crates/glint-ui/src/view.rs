@@ -50,6 +50,7 @@ pub(crate) enum WindowOp {
     ResizeDip(SizeF),
     Show { activate: bool },
     Hide,
+    RenderHidden,
     Activate,
     SetOpacity(f32),
     SetTopmost(bool),
@@ -206,6 +207,12 @@ impl Ctx {
 
     pub fn hide_window(&mut self) {
         self.out.ops.push(WindowOp::Hide);
+    }
+
+    /// Renders one frame while the window stays hidden: creates its swapchain and warms its render target, so a later
+    /// `show_window` only paints and presents (windows kept ready for instant display).
+    pub fn render_hidden(&mut self) {
+        self.out.ops.push(WindowOp::RenderHidden);
     }
 
     pub fn activate(&mut self) {

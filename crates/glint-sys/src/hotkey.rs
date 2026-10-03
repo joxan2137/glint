@@ -10,7 +10,13 @@ use std::{
 };
 use windows::Win32::{
     Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Threading::{
+            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY,
+            THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+        },
+    },
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
@@ -224,6 +230,13 @@ fn inject_mask() {
     }
 }
 
+/// Keeps the shortcut responsive while a game saturates the CPU.
+fn raise_current_thread_priority(priority: THREAD_PRIORITY) {
+    if let Err(error) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
+        log::warn!("Could not raise hotkey thread priority: {error}");
+    }
+}
+
 fn install_hook() -> windows::core::Result<HHOOK> {
     let module = unsafe { GetModuleHandleW(None)? };
     unsafe {
@@ -254,6 +267,7 @@ impl KeyboardHook {
         let dispatcher = thread::Builder::new()
             .name("glint-hotkey-actions".into())
             .spawn(move || {
+                raise_current_thread_priority(THREAD_PRIORITY_HIGHEST);
                 while let Ok(action) = receiver.recv() {
                     let outcome =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_action(action)));
@@ -265,6 +279,7 @@ impl KeyboardHook {
         let hook_thread = match thread::Builder::new()
             .name("glint-keyboard-hook".into())
             .spawn(move || {
+                raise_current_thread_priority(THREAD_PRIORITY_TIME_CRITICAL);
                 let thread_id = unsafe { GetCurrentThreadId() };
                 let mut message = MSG::default();
                 unsafe {

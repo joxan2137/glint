@@ -33,8 +33,8 @@ use crate::settings_model::{
 };
 use crate::settings_view::{MIN_SIZE, SettingsMessage, SettingsView, WINDOW_SIZE};
 use crate::system::{
-    cursor_pos, display_rects, hide_instantly, hwnd, join_bounded, monitor_at, raise_ui_priority, raise_worker_priority,
-    show_again,
+    capture_skips_excluded_windows, cursor_pos, display_rects, hide_instantly, hwnd, join_bounded, monitor_at,
+    raise_ui_priority, raise_worker_priority, show_again,
 };
 use crate::thumbnail::{ThumbnailAction, ThumbnailContent, ThumbnailEvent, ThumbnailView, card_size};
 use crate::toast::{Tint, Toast, ToastClosed, ToastIcon, ToastView};
@@ -162,6 +162,17 @@ struct State {
     capture_generation: u64,
     /// The open overlay and the capture generation feeding it.
     overlay: Option<(u64, OverlaySession)>,
+    /// An overlay that opens once its capture is done (`capture_skips_excluded_windows` is false).
+    deferred_overlay: Option<DeferredOverlay>,
+    /// Thumbnail and toast hidden so the capture cannot see them (raw HWNDs).
+    hidden_popups: Vec<isize>,
+}
+
+struct DeferredOverlay {
+    generation: u64,
+    mode: CaptureMode,
+    video: bool,
+    requested_at: Instant,
 }
 
 /// What `main` does after the loop ends.
@@ -218,6 +229,8 @@ pub fn run(initial: Command) -> Result<Exit> {
                 display_timer: None,
                 capture_generation: 0,
                 overlay: None,
+                deferred_overlay: None,
+                hidden_popups: Vec::new(),
             })),
             proxy,
         };
@@ -599,6 +612,10 @@ impl Glint {
             };
             (state.settings.hdr.clone(), intent, state.capture_generation)
         };
+        let defer_overlay = !capture_skips_excluded_windows();
+        if defer_overlay {
+            self.hide_popups(app);
+        }
         let proxy = self.proxy.clone();
         let started = spawn_worker("glint-capture", move || {
             raise_worker_priority();
@@ -613,19 +630,50 @@ impl Glint {
         });
         if started.is_none() {
             self.state.borrow_mut().busy = Busy::Idle;
+            self.restore_popups(true);
             let detail = Some("Windows could not start a capture thread");
             self.toast(app, Toast::new(ToastIcon::Symbol(glint_ui::Icon::Info, Tint::Destructive), "Couldn't capture the screen", detail));
             return false;
         }
         if let Intent::Overlay { mode, video } = intent {
-            return self.open_live_overlay(app, mode, video, generation, requested_at);
+            if defer_overlay {
+                self.state.borrow_mut().deferred_overlay = Some(DeferredOverlay { generation, mode, video, requested_at });
+                return true;
+            }
+            return self.open_live_overlay(app, mode, video, generation, requested_at, Vec::new());
         }
         true
     }
 
+    /// Windows 10 draws capture-excluded windows black in a desktop capture, so the thumbnail and toast leave the
+    /// screen before one starts.
+    fn hide_popups(&self, app: &App) {
+        let mut state = self.state.borrow_mut();
+        let windows: Vec<isize> =
+            [&state.thumbnail, &state.toast].into_iter().flatten().filter_map(|popup| app.hwnd(popup.window)).collect();
+        let hidden: Vec<isize> = windows.into_iter().filter(|&window| hide_instantly(window)).collect();
+        state.hidden_popups.extend(hidden);
+    }
+
+    /// Shows the popups `hide_popups` hid again when nothing replaced them (`show`); otherwise only forgets them.
+    fn restore_popups(&self, show: bool) {
+        let hidden = std::mem::take(&mut self.state.borrow_mut().hidden_popups);
+        if show {
+            hidden.into_iter().for_each(|window| show_again(window, false));
+        }
+    }
+
     /// Opens the overlay over the live desktop: cached monitors, a synchronous window snapshot (hover highlights),
-    /// pooled windows when they fit. The capture already runs on a worker.
-    fn open_live_overlay(&self, app: &App, mode: CaptureMode, video: bool, generation: u64, requested_at: Instant) -> bool {
+    /// pooled windows when they fit. The capture already runs on a worker, or has finished when `captures` is given.
+    fn open_live_overlay(
+        &self,
+        app: &App,
+        mode: CaptureMode,
+        video: bool,
+        generation: u64,
+        requested_at: Instant,
+        captures: Vec<MonitorCapture>,
+    ) -> bool {
         let snapshot_started = Instant::now();
         let windows = glint_capture::windows_snapshot(Some(std::process::id()));
         let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
@@ -633,7 +681,7 @@ impl Glint {
         let settings = self.settings();
         let request = OverlayRequest {
             monitors,
-            captures: Vec::new(),
+            captures,
             windows,
             mode,
             video,
@@ -801,6 +849,7 @@ impl Glint {
             Err(error) => {
                 self.state.borrow_mut().busy = Busy::Idle;
                 self.restore_editors(true);
+                self.restore_popups(true);
                 self.error_toast(app, "Couldn't capture the screen", &error);
                 return;
             }
@@ -813,6 +862,7 @@ impl Glint {
                 let snip = frozen
                     .foreground
                     .and_then(|window| glint_overlay::snip_rect(&frozen.captures, window.rect, &settings.hdr, CaptureMode::Window));
+                self.restore_popups(snip.is_none());
                 match snip {
                     Some(snip) => self.finish_snip(app, snip, CaptureSource::WindowShortcut),
                     None => self.toast(app, Toast::new(ToastIcon::Symbol(glint_ui::Icon::AppWindow, Tint::Neutral), "No window to capture", None)),
@@ -830,6 +880,21 @@ impl Glint {
 
     /// The frozen desktop for the open overlay (dropped when that overlay already closed).
     fn on_overlay_captured(&self, app: &App, generation: u64, result: Result<Frozen>) {
+        let deferred = self.state.borrow_mut().deferred_overlay.take_if(|d| d.generation == generation);
+        if let Some(DeferredOverlay { mode, video, requested_at, .. }) = deferred {
+            match result {
+                Ok(frozen) => {
+                    self.open_live_overlay(app, mode, video, generation, requested_at, frozen.captures);
+                }
+                Err(error) => {
+                    self.state.borrow_mut().busy = Busy::Idle;
+                    self.restore_editors(true);
+                    self.restore_popups(true);
+                    self.error_toast(app, "Couldn't capture the screen", &error);
+                }
+            }
+            return;
+        }
         let Some(session) = self.overlay_session(generation) else {
             log::info!("capture finished after its overlay closed; dropped");
             return;
@@ -858,6 +923,7 @@ impl Glint {
             self.refresh_settings_window(app);
         }
         self.restore_editors(matches!(outcome, OverlayOutcome::Cancelled));
+        self.restore_popups(matches!(outcome, OverlayOutcome::Cancelled));
         log::info!("overlay closed: {}", outcome_label(&outcome));
         match outcome {
             OverlayOutcome::Cancelled => {}

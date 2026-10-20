@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use glint_core::{Image, MonitorInfo, PointI, RectI};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority,
     THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
@@ -60,6 +61,44 @@ pub fn display_rects() -> Vec<RectI> {
     // SAFETY: the callback only writes into `rects`, which outlives the enumeration.
     let _ = unsafe { EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut rects as *mut Vec<RectI> as isize)) };
     rects
+}
+
+/// Windows' build number (`CurrentBuildNumber`), 0 when it cannot be read.
+pub fn windows_build() -> u32 {
+    let mut buffer = [0u16; 16];
+    let mut size = size_of_val(&buffer) as u32;
+    // SAFETY: reads one string into a buffer of the stated size.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if !status.is_ok() {
+        return 0;
+    }
+    let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len]).trim().parse().unwrap_or(0)
+}
+
+/// Windows 11 leaves capture-excluded windows out of desktop duplication; Windows 10 draws them black, so there the
+/// snip overlay must not be on screen while the desktop is captured. `GLINT_DEFER_OVERLAY=1` forces the Windows 10
+/// behaviour.
+pub fn capture_skips_excluded_windows() -> bool {
+    static SKIPS: OnceLock<bool> = OnceLock::new();
+    *SKIPS.get_or_init(|| {
+        let forced = std::env::var_os("GLINT_DEFER_OVERLAY").is_some_and(|value| value == "1");
+        let build = windows_build();
+        let skips = !forced && build >= 22000;
+        let order = if skips { "opens before the capture" } else { "opens once the capture is done" };
+        log::info!("Windows build {build}: the snip overlay {order}");
+        skips
+    })
 }
 
 /// Snipping must feel instant while a game saturates the CPU: the process runs above normal (idle cost is zero)
